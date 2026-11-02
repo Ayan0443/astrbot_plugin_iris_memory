@@ -810,6 +810,68 @@ class IrisMemoryPlugin(Star):
         if self.component_manager:
             await handle_user_message(event, self.component_manager)
 
+        # 纯媒体消息（贴纸/图片/语音，没有实际文字）：先记录，再交给模型判断
+        # 要不要回应——贴纸往往只是情绪表达，逐条回应会显得聒噪。
+        if self._is_media_only_message(event) and not await self._should_reply_to_media(event):
+            event.stop_event()
+
+    async def _should_reply_to_media(self, event: AstrMessageEvent) -> bool:
+        """让模型判断一条纯媒体消息是否值得回应；判断失败时默认不回应。"""
+        manager = None
+        if self.component_manager:
+            manager = self.component_manager.get_available_component("llm_manager")
+        if manager is None:
+            return False
+
+        recent = ""
+        try:
+            buffer = self.component_manager.get_available_component("l1_buffer")
+            if buffer is not None:
+                from .iris_memory.platform import get_adapter
+
+                adapter = get_adapter(event)
+                session_id = adapter.get_session_id(event)
+                messages = buffer.get_context(session_id, 6) or []
+                recent = "\n".join(
+                    f"{getattr(m, 'sender_name', '')}: {getattr(m, 'content', '')}"
+                    for m in messages[-6:]
+                )
+        except Exception:
+            recent = ""
+
+        prompt = (
+            "你收到一条只含贴纸/图片、没有文字的消息。请判断此刻要不要回一句。\n"
+            "原则：贴纸大多只是情绪表达，默认不回；只有当它明显在等你接话、"
+            "或与刚聊的内容强相关、或对方连续发来像在求关注时，才需要回应。\n"
+            "只输出 JSON，不要解释：{\"reply\": true} 或 {\"reply\": false}\n\n"
+            f"最近对话：\n{recent or '（无）'}\n\n"
+            f"本条消息：{event.message_str}"
+        )
+        try:
+            provider_id = await self._get_provider_id(event)
+            out = await manager.generate(
+                prompt,
+                module="media_reply_gate",
+                provider_id=provider_id or None,
+                timeout=30,
+            )
+        except Exception as exc:
+            logger.warning(f"[iris] 媒体回应判断失败，默认不回复：{exc}")
+            return False
+        return '"reply":true' in out.replace(" ", "").lower()
+
+    @staticmethod
+    def _is_media_only_message(event: AstrMessageEvent) -> bool:
+        """判断消息是否只有媒体占位符、没有真实文字。"""
+        text = (event.message_str or "").strip()
+        if not text:
+            return True
+        # 去掉 [图片]/[贴纸]/[视频]/[语音]/[文件] 一类占位符
+        rest = re.sub(r"\[[^\]]{1,8}\]", " ", text)
+        # 去掉 emoji 与标点等非文字符号；中文/字母/数字会保留
+        rest = re.sub(r"[\W_]+", "", rest, flags=re.UNICODE)
+        return not rest.strip()
+
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("iris_mem")
     async def iris_mem(self, event: AstrMessageEvent) -> None:
