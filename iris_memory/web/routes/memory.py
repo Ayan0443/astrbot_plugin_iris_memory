@@ -14,6 +14,7 @@ from ...l2_memory.adapter import L2MemoryAdapter
 from ...l3_kg.adapter import L3KGAdapter
 from ...platform.base import PRIVATE_SESSION_PREFIX
 from ...profile.storage import ProfileStorage
+from ...utils.log_redact import text_for_log
 
 logger = get_logger("web.memory")
 
@@ -84,7 +85,7 @@ async def search_l2_memory():
         for r in results
     ]
 
-    logger.info(f"搜索L2记忆成功：查询='{query[:20]}...', 结果数={len(results)}")
+    logger.info(f"搜索L2记忆成功：查询='{text_for_log(query, 20)}...', 结果数={len(results)}")
 
     return jsonify({"success": True, "results": formatted_results})
 

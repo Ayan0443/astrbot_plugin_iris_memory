@@ -152,7 +152,11 @@ class GetProfileTool(FunctionTool[AstrAgentContext]):
             lines.append(f"**沟通偏好**: {profile.communication_style}")
 
         if profile.emotional_baseline:
-            lines.append(f"**情感基线**: {profile.emotional_baseline}")
+            from ..lifelike.guards.numeric import emotion_hint
+
+            hint = emotion_hint(profile.emotional_baseline)
+            if hint is not None:
+                lines.append(f"**情感基线{hint[0]}**: {hint[1]}")
 
         if profile.bot_relationship:
             lines.append(f"**用户对你的称呼**: {profile.bot_relationship}")
@@ -172,7 +176,9 @@ class GetProfileTool(FunctionTool[AstrAgentContext]):
         if profile.important_events:
             lines.append(f"**重要事件**: {', '.join(profile.important_events)}")
 
-        return "\n".join(lines)
+        from ..lifelike.guards.numeric import guard_text
+
+        return guard_text("\n".join(lines), source="tool_get_profile", strict=True)
 
     def _format_group_profile(self, profile: GroupProfile) -> str:
         lines = [

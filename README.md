@@ -1,4 +1,35 @@
-# Iris Memory - 三合一智能陪伴
+# Iris Memory - 三合一智能陪伴（活人感分支 / lifelike fork）
+
+> 这是 [leafliber/astrbot_plugin_iris_memory](https://github.com/leafliber/astrbot_plugin_iris_memory) 的修改版，在原插件之上加了一组“活人感”功能，面向 Telegram 私人陪伴角色。原插件的全部能力都保留，新功能都有开关，默认关闭。
+> 想开箱即用（AstrBot + 本插件 + Telegram 适配器 + 推荐配置 + 空白人设模板），请用配套的启动仓库：[Ayan0443/astrbot-lifelike-starter](https://github.com/Ayan0443/astrbot-lifelike-starter)。
+
+## 本分支新增了什么
+
+| 功能 | 开关（隐藏配置） | 说明 |
+| --- | --- | --- |
+| 对话连续性 | 面板 `continuity.*` | 记住“待续事项”和她答应过的事，之后自然接上；消息合并、话说一半时等一等 |
+| 私聊自由主动 | `lifelike_proactive_freedom` | 由她自己判断什么时候私聊主人；只保留去重、防故障连发和“别发了”指令 |
+| 白名单群自由搭话 | `lifelike_group_freedom`、`lifelike_chat_drive` | 白名单群里任何人的发言都交给她决定要不要接话，也可以主动开话题 |
+| 群→私聊关心 | `lifelike_care_bridge_groups` | 从主人在群里的发言里看出累了、病了、有好事，私下关心一句并说明来源 |
+| 群友认知 | `lifelike_member_mode`、`lifelike_member_nickname` | 从授权群的公开发言形成轻量印象，同一账号跨群合并；学会群里对人的常用称呼 |
+| 关系渐进 | `lifelike_relation_mode`、`lifelike_bond_mode` | 相处越久越亲近、越信任；只用文字化阶段，不往提示里放任何好感数值 |
+| 用户推测性认知 | `lifelike_memory_mode` | 记住对主人的推测（带把握程度，可查看、可删除） |
+| 被冒犯时回怼 | `lifelike_counter_mode` | 区分玩笑和恶意，恶意时简短回击；同一人纠缠超过轮数后不再理会 |
+| 口吻控制 | `style_*` | 风格守卫（拦截照搬口癖、AI 腔、说教）、卖萌档位、随性标点、风格示例库 |
+| 表情包 | 面板 `continuity.sticker_*`、`lifelike_sticker_*` | 理解贴纸；从主人私聊和群里用过的贴纸自动学习；她自己会挑场合发 |
+| 日志去正文 | `lifelike_log_redact`（默认开） | INFO 日志不记聊天原文和语音识别原文，只记长度 |
+| 角色身份配置 | `identity_bot_names`、`identity_owner_names`、`persona_reference_file` | 代码里不写死任何名字；她的名字、主人称呼、参照角色（不许照搬的口癖）都在配置里 |
+
+完整开关说明见启动仓库的 `docs/FEATURES.md`。
+
+## 许可证与改动声明
+
+- 原插件 README 声明采用 AGPL-3.0；本分支补上了 `LICENSE` 全文，修改部分同样以 AGPL-3.0 发布。
+- `iris_memory/continuity/` 的部分规则改编自 SurfCore（MIT），见 `iris_memory/continuity/THIRD_PARTY_NOTICES.md`。
+- 改动范围：新增 `iris_memory/continuity/`、`iris_memory/lifelike/`、`iris_memory/stickers/`、`iris_memory/style/`、`iris_memory/identity.py`、`tools/lifelike_eval/` 及对应测试；修改了 `main.py`、`iris_memory/proactive/`、`iris_memory/config/`、`iris_memory/learning/` 等。逐行差异请与上游 `v3.2.1`（`cdb8fee`）对比。
+
+---
+
 > 面向 AstrBot 的轻量化三合一智能陪伴插件：记忆、主动回复、人格自学习迭代。
 
 [![AstrBot Plugin](https://img.shields.io/badge/AstrBot-Plugin-6f42c1)](https://github.com/AstrBotDevs/AstrBot)

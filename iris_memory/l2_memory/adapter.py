@@ -2636,6 +2636,41 @@ class L2MemoryAdapter(Component):
             logger.error(f"淘汰记忆失败：{e}", exc_info=True)
             return 0
 
+    async def archive_superseded(
+        self, memory_ids: List[str], superseded_by: str, reason: str = "dream_contradiction"
+    ) -> int:
+        """活人感 P1-7（设计 §6.5，G7）：冲突消解中被替代的条目改为归档 + superseded 标记，
+        不再硬删除；可经 ``/iris_mem l2 restore`` 在归档保留期内恢复。"""
+        if not self._is_available or not memory_ids:
+            return 0
+        try:
+            with self._lock:
+                if self._db is None:
+                    return 0
+                placeholders = ",".join("?" for _ in memory_ids)
+                rows = self._db.execute(
+                    f"SELECT memory_id, metadata FROM memories WHERE memory_id IN ({placeholders})",
+                    memory_ids,
+                ).fetchall()
+                now = datetime.now().isoformat()
+                for memory_id, metadata_json in rows:
+                    try:
+                        meta = json.loads(metadata_json or "{}")
+                    except (TypeError, ValueError):
+                        meta = {}
+                    meta["status"] = "superseded"
+                    meta["superseded_by"] = superseded_by
+                    meta["superseded_at"] = now
+                    self._db.execute(
+                        "UPDATE memories SET metadata = ? WHERE memory_id = ?",
+                        (json.dumps(meta, ensure_ascii=False), memory_id),
+                    )
+                self._db.commit()
+            return await self._archive_entries(memory_ids, reason=reason)
+        except Exception as e:
+            logger.error(f"归档被替代记忆失败：{type(e).__name__}")
+            return 0
+
     # ========================================================================
     # 归档与恢复
     # ========================================================================

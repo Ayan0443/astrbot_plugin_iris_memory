@@ -10,6 +10,7 @@ from typing import List, Optional
 from ..core import get_logger
 from ..config import get_config
 from .storage import ProfileStorage, profile_lock
+from ..utils.log_redact import text_for_log
 from .models import (
     GroupProfile,
     UpdateTier,
@@ -316,4 +317,4 @@ class GroupProfileManager:
             meta.record_update(1.0, source="manual")
             profile.set_field_meta("blacklist_topics", meta)
             await self._storage.save_group_profile(profile, persona_id=persona_id)
-            logger.info(f"添加群聊禁忌话题: {group_id} -> {topic}")
+            logger.info(f"添加群聊禁忌话题: {group_id} -> {text_for_log(topic, len(str(topic)))}")

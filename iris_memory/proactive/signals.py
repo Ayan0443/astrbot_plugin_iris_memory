@@ -4,6 +4,7 @@ import time
 
 from astrbot.api import logger
 
+from .activity_gate import in_minute_range
 from .config import ConfigManager
 from .perception import WindowMessage
 from .state import GroupState, StateManager
@@ -19,6 +20,88 @@ class SignalGate:
     def __init__(self, config: ConfigManager, state: StateManager) -> None:
         self._config = config
         self._state = state
+        # 内存态即可：重启后保守地全部失效。
+        self._owner_last: dict[str, float] = {}
+        self._engaged: dict[str, dict[str, float]] = {}
+
+    # ---- 群聊门控 ----
+
+    def mark_engaged(self, group_id: str, sender_id: str, now: float | None = None) -> None:
+        """非主人群友明确找她（@ / 回复 / 叫名字）：从此刻起开放有限时长的跟进。"""
+        if not group_id or not sender_id:
+            return
+        self._engaged.setdefault(group_id, {})[str(sender_id)] = (
+            now if now is not None else time.time()
+        )
+
+    def is_engaged(self, group_id: str, sender_id: str, now: float | None = None) -> bool:
+        since = self._engaged.get(group_id, {}).get(str(sender_id))
+        if since is None:
+            return False
+        now = now if now is not None else time.time()
+        if now - since < self._config.engaged_window * 60:
+            return True
+        self._engaged[group_id].pop(str(sender_id), None)
+        return False
+
+    def mentions_bot_name(self, text: str) -> bool:
+        low = (text or "").lower()
+        return any(k in low for k in self._config.bot_name_keywords)
+
+    def evaluate_group_message(
+        self,
+        group_id: str,
+        sender_id: str,
+        text: str,
+        owner_ids: set[str],
+        now: float | None = None,
+    ) -> tuple[str | None, str]:
+        """群聊消息门控，返回 (motive, trigger)。
+
+        - 主人发言：每条（去抖后）都交给决策层，由她自己决定接不接；
+        - 其他人：不再做计数采样插话。只有叫她名字时进入一次决策，
+          或在明确找过她之后 engaged_window 内命中锚点时跟进。
+        trigger: "owner" | "name" | "follow" | ""
+        """
+        if not self._config.enabled:
+            return None, ""
+        now = now if now is not None else time.time()
+        sender_id = str(sender_id or "")
+        is_owner = bool(sender_id) and sender_id in owner_ids
+        self._state.increment_msg_count(group_id)
+        data = self._state.get_state(group_id)
+        # 冷却/静音只约束她的“不请自来”：叫她名字不受影响；
+        # 主人发言不受冷却影响（静音时段仍然遵守）。
+        cooling = data.state == GroupState.COOLDOWN
+        muted = self._state.is_muted()
+
+        if self.mentions_bot_name(text):
+            if not is_owner:
+                self.mark_engaged(group_id, sender_id, now)
+            else:
+                self._owner_last[group_id] = now
+            self._state.reset_sampling(group_id)
+            return "chime_in", "name"
+
+        if muted or (cooling and not is_owner):
+            return None, ""
+
+        engaged = is_owner or self.is_engaged(group_id, sender_id, now)
+        if engaged:
+            if sender_id and self._state.match_anchor_user(group_id, sender_id):
+                self._state.reset_sampling(group_id)
+                return "follow_up", "follow"
+            if self._state.match_anchor_keyword(group_id, text):
+                self._state.reset_sampling(group_id)
+                return "follow_up", "follow"
+
+        if is_owner:
+            last = self._owner_last.get(group_id, 0.0)
+            if now - last >= self._config.owner_chime_debounce:
+                self._owner_last[group_id] = now
+                self._state.reset_sampling(group_id)
+                return "chime_in", "owner"
+        return None, ""
 
     def evaluate_message(self, group_id: str, sender_id: str, text: str) -> str | None:
         """消息唤醒门控，返回候选动机 "follow_up" | "chime_in" | None。"""
@@ -48,18 +131,49 @@ class SignalGate:
             return "chime_in"
         return None
 
-    def evaluate_timer(self, group_id: str, messages: list[WindowMessage]) -> str | None:
+    def lifelike_quiet_now(self, now: float | None = None) -> bool:
+        """活人感 P0-8：是否处于 ``lifelike_proactive_quiet_hours`` 硬静音时段（空 = 否）。"""
+        try:
+            cfg = self._config.activity_gate_config
+            rng = getattr(cfg, "quiet_hours", None)
+            if rng is None:
+                return False
+            t = time.localtime(time.time() if now is None else now)
+            return in_minute_range(t.tm_hour * 60 + t.tm_min, rng)
+        except Exception:
+            return False
+
+    def evaluate_timer(
+        self,
+        group_id: str,
+        messages: list[WindowMessage],
+        *,
+        last_activity_hint: float | None = None,
+        defer: bool = False,
+    ) -> str | None:
         """定时器唤醒门控，返回 "initiate" | None。
 
         达到最小静默底线后按风险率进行一次独立概率试验；风险率综合静默
         时长、回复意愿、话题状态和无人接话疲劳，不存在必然点火阈值。
+
+        活人感 P0-8（参数缺省时与原行为一致）：
+        - ``last_activity_hint``：窗口为空时由账本推得的最后互动时间；给出时不再因
+          窗口为空直接放弃，而是用它计算静默时长；
+        - ``defer``：活动窗口判定要求推迟——与静音一样冻结概率时钟，本次不触发；
+        - ``lifelike_proactive_quiet_hours`` 内恒不触发（同样冻结）。
         """
         if not self._config.enabled or not self._config.proactive_enabled:
+            return None
+        # 群里默认不定时主动开话题（只对主人私聊保留定时发起）。
+        if (
+            not str(group_id).startswith("private:")
+            and not self._config.group_initiate_enabled
+        ):
             return None
         data = self._state.get_state(group_id)
         if data.state == GroupState.COOLDOWN:
             return None
-        if not messages:
+        if not messages and last_activity_hint is None:
             return None
         if data.initiate_pending_since > 0:
             return None
@@ -75,12 +189,16 @@ class SignalGate:
         if now - data.last_initiate_time < self._config.proactive_min_interval * 60:
             return None
 
-        last_activity = max(messages[-1].timestamp, data.last_human_message_at)
+        last_activity = max(
+            messages[-1].timestamp if messages else 0.0,
+            data.last_human_message_at,
+            float(last_activity_hint or 0.0),
+        )
         quiet = max(0.0, now - last_activity)
         fired = self._state.evaluate_initiate_hazard(
             group_id,
             now=now,
             quiet_seconds=quiet,
-            freeze=self._state.is_muted(),
+            freeze=self._state.is_muted() or defer or self.lifelike_quiet_now(now),
         )
         return "initiate" if fired else None

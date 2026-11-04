@@ -23,6 +23,7 @@ from .all_handler import AllCommandHandler
 from .learning_handler import LearningCommandHandler
 from .evolve_handler import EvolutionCommandHandler
 from .executor import execute_command
+from .lifelike_handler import BeliefsCommandHandler, ForgetCommandHandler
 
 __all__ = [
     "CommandHandler",
@@ -41,4 +42,6 @@ __all__ = [
     "LearningCommandHandler",
     "EvolutionCommandHandler",
     "execute_command",
+    "BeliefsCommandHandler",
+    "ForgetCommandHandler",
 ]

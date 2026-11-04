@@ -27,6 +27,17 @@ from ..l2_memory.models import MemoryEntry
 logger = get_logger("dream.contradiction")
 
 
+def _archive_enabled() -> bool:
+    """``lifelike_dream_contradiction_archive``（默认 true，修复项）：false=恢复硬删除旧行为"""
+    try:
+        v = get_config().get("lifelike_dream_contradiction_archive", True)
+    except Exception:
+        return True
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "off", "no")
+    return bool(True if v is None else v)
+
+
 class ContradictionPhase:
     """矛盾消解阶段
 
@@ -318,6 +329,21 @@ class ContradictionPhase:
         keep_entry.metadata["kg_processed"] = False
         await l2.update_metadata(keep_entry.id, keep_entry.metadata)
         if delete_ids:
+            if _archive_enabled() and hasattr(l2, "archive_superseded"):
+                # 活人感 P1-7（设计 §6.5，G7）：被替代条目归档 + superseded，不再硬删
+                archived = 0
+                try:
+                    archived = int(await l2.archive_superseded(delete_ids, keep_entry.id) or 0)
+                except Exception as e:
+                    logger.warning(f"[lifelike.dream] archive failed: {type(e).__name__}")
+                if archived > 0:
+                    if archived < len(delete_ids):
+                        logger.warning(
+                            f"[lifelike.dream] archive incomplete archived={archived} expected={len(delete_ids)}"
+                        )
+                    logger.info(f"矛盾消解：保留 [{resolved_idx + 1}]，归档 {archived} 条（superseded，可恢复）")
+                    return True
+                logger.warning("[lifelike.dream] archive returned 0, fallback to delete")
             await l2.delete_entries(delete_ids)
         logger.info(f"矛盾消解：保留 [{resolved_idx + 1}]，删除 {len(delete_ids)} 条")
         return True

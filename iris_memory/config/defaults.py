@@ -9,7 +9,7 @@ Iris Chat Memory - 默认配置定义
 """
 
 from dataclasses import dataclass, field, asdict
-from typing import Literal, Optional, Dict
+from typing import Literal, Optional, Dict, List
 
 
 @dataclass
@@ -1168,6 +1168,652 @@ class HiddenConfig:
         metadata={"description": "连续解析/校验失败熔断次数（达到后 Job 转 paused_error）", "group": "人格自迭代"},
     )
 
+    # 活人感 P0-1：收口旁路出站（修复项，不受 lifelike_enable 控制）
+    lifelike_strip_bypass_tools: bool = field(
+        default=True,
+        metadata={
+            "description": "从主管线 LLM 请求中剥离绕过 Iris 账本的内置工具"
+            "（send_message_to_user / future_task）；false 恢复 AstrBot 默认挂载",
+            "group": "活人感·出站",
+        },
+    )
+
+    # 活人感 P0-8：主动安全底线（修复项，不受 lifelike_enable 控制）
+    lifelike_proactive_quiet_hours: str = field(
+        default="",
+        metadata={
+            "description": "主动发起的硬静音时段 HH:MM-HH:MM（可跨午夜）；空 = 沿用现网"
+            "（reply_mute_* 静音设置），格式错误同样视为空",
+            "group": "活人感·主动底线",
+        },
+    )
+    lifelike_proactive_activity_gate: bool = field(
+        default=True,
+        metadata={
+            "description": "活动窗口判定：当前时段历史上主人几乎不活跃、且最近一段时间没有互动时，"
+            "推迟私聊主动发起（不是硬静音，主人醒着聊天时照常）",
+            "group": "活人感·主动底线",
+        },
+    )
+    lifelike_activity_recent_hours: float = field(
+        default=6.0,
+        metadata={
+            "description": "活动窗口判定：最近多少小时内有过互动就不推迟",
+            "group": "活人感·主动底线",
+        },
+    )
+    lifelike_activity_lookback_days: int = field(
+        default=28,
+        metadata={"description": "活动窗口判定：统计主人作息的回看天数", "group": "活人感·主动底线"},
+    )
+    lifelike_activity_min_days: int = field(
+        default=7,
+        metadata={
+            "description": "活动窗口判定：主人至少有多少个活跃日才用历史判定，不足时用先验时段",
+            "group": "活人感·主动底线",
+        },
+    )
+    lifelike_activity_inactive_ratio: float = field(
+        default=0.1,
+        metadata={
+            "description": "活动窗口判定：某小时的活跃日占全部活跃日的比例低于此值视为几乎不活跃",
+            "group": "活人感·主动底线",
+        },
+    )
+    lifelike_activity_prior_inactive: str = field(
+        default="01:00-08:00",
+        metadata={
+            "description": "活动窗口判定：历史数据不足时视为几乎不活跃的先验时段 HH:MM-HH:MM；"
+            "空 = 数据不足时不推迟",
+            "group": "活人感·主动底线",
+        },
+    )
+    lifelike_proactive_empty_window: bool = field(
+        default=False,
+        metadata={
+            "description": "窗口为空（如重启且主人 24h 未说话）时，用水位 + 出站账本判断最后互动时间，"
+            "继续调度私聊主动；false（默认，首发保守）= 现网（窗口为空即不调度）。"
+            "打开后重启当晚可能多出一条无上下文的主动私聊，先看回放再开",
+            "group": "活人感·主动底线",
+        },
+    )
+    # 活人感改造 P0-2（独立生效，不受 lifelike_enable 控制）
+    lifelike_error_friendly_agent: bool = field(
+        default=True,
+        metadata={
+            "description": "agent 异常时把 core 英文原始报错替换为中文友好文案（还需 extras.error_friendly.enable）",
+            "group": "活人感",
+        },
+    )
+    lifelike_adapter_watchdog: bool = field(
+        default=True,
+        metadata={
+            "description": "适配器失联心跳告警：断开超过阈值写 ERROR 日志与 health 文件（不重启、不发消息）",
+            "group": "活人感",
+        },
+    )
+    lifelike_adapter_down_threshold_s: int = field(
+        default=300,
+        metadata={"description": "适配器断开多少秒后判定失联(秒，最少 60)", "group": "活人感"},
+    )
+    lifelike_adapter_watchdog_period_s: int = field(
+        default=60,
+        metadata={"description": "失联检查间隔(秒，最少 10)", "group": "活人感"},
+    )
+
+    # 活人感 P0-3：隐私（日志去正文、第三方原文保留期）；不受 lifelike_enable 控制
+    lifelike_log_redact: bool = field(
+        default=True,
+        metadata={
+            "description": "INFO 及以上日志不记聊天正文（适配器入站、core 收发行改为只记长度）；DEBUG 级不过滤",
+            "group": "活人感·隐私",
+        },
+    )
+    lifelike_retention_days_observed: int = field(
+        default=30,
+        metadata={
+            "description": "群/频道第三方原文（observed_posts 中 author_kind=other）保留天数；0 = 不清理",
+            "group": "活人感·隐私",
+        },
+    )
+    lifelike_retention_dry_run: bool = field(
+        default=True,
+        metadata={
+            "description": "保留期清理只计数写日志、不删除（主人批准实删前保持 true）",
+            "group": "活人感·隐私",
+        },
+    )
+
+    # 活人感改造（docs/lifelike-20261103，P0 开关各自独立生效，不受 lifelike_enable 控制）
+    lifelike_session_extract_mode: str = field(
+        default="off",
+        metadata={
+            "description": "会话批量抽取事项（P0-4）：off 关闭 / shadow 只记计数不写事项 / on 写入事项",
+            "group": "活人感",
+        },
+    )
+    lifelike_budget_cheap_calls_daily: int = field(
+        default=80,
+        metadata={
+            "description": "活人感廉价模型每日调用硬上限（所有 lifelike_* 模块合计；0=禁止调用）",
+            "group": "活人感",
+        },
+    )
+    lifelike_budget_cheap_tokens_daily: int = field(
+        default=150000,
+        metadata={
+            "description": "活人感廉价模型每日 token 硬上限（输入+输出，所有 lifelike_* 模块合计；0=禁止调用）",
+            "group": "活人感",
+        },
+    )
+
+    # 活人感 P0-5：数值泄漏守卫（修复项，不受 lifelike_enable 控制）
+    lifelike_numeric_guard: bool = field(
+        default=True,
+        metadata={
+            "description": "注入段中好感度/分值/百分比等数值化关系表达整行丢弃，并隔离画像好感度残留（false=恢复旧行为）",
+            "group": "活人感",
+        },
+    )
+    lifelike_emotion_hint: Literal["auto", "off", "hedged", "raw"] = field(
+        default="auto",
+        metadata={
+            "description": "画像情感推测注入：auto=认知模块(lifelike_memory_mode)为 on 前不注入；off；hedged=带'可能'与未确认标注；raw=旧格式。守卫关闭时恒为 raw",
+            "group": "活人感",
+        },
+    )
+
+    # 活人感·风格审查（docs/lifelike-20261103 ROADMAP P0-6；P0 开关各自独立生效，不受 lifelike_enable 控制）
+    lifelike_style_guard_mode: str = field(
+        default="log",
+        metadata={
+            "description": "StyleGuard 风格审查（P0-6）：off 关闭 / log 只记规则 id 到 style_audit，不改写回复（P0 只开放到 log）",
+            "group": "活人感",
+        },
+    )
+    learning_cutesy_gate: bool = field(
+        default=True,
+        metadata={
+            "description": "学习采集零 LLM 闸门（做作/过度卖萌/照搬/跟随一轮不入库）+ 对话审查新增 cutesy/catchphrase/copied 标准",
+            "group": "活人感",
+        },
+    )
+    learning_persona_review_anime: bool = field(
+        default=False,
+        metadata={
+            "description": "Persona 复审追加动漫口吻/照搬/卖萌超范围两句标准（复审判不兼容会删除条目；只读副本试跑并经主人确认后再打开）",
+            "group": "活人感",
+        },
+    )
+
+    # 口吻风格层（ROADMAP P1-2 / P1-4，口吻附录 §4、§5.3；独立风格层，不受 lifelike_enable 控制）
+    style_anime_register: str = field(
+        default="medium",
+        metadata={
+            "description": "<iris:style> 口吻档位上限：off 不注入（改造前行为）/ light 淡 / medium 中 / strong 浓；实际档位 = min(场景档位, 本值)",
+            "group": "活人感",
+        },
+    )
+    style_group_register_cap: str = field(
+        default="light",
+        metadata={
+            "description": "群聊口吻档位上限：off 群聊不注入 / light / medium（D5：群聊淡档）",
+            "group": "活人感",
+        },
+    )
+    style_cute_cap: str = field(
+        default="occasional",
+        metadata={
+            "description": "卖萌档上限：off 不卖萌 / rare 很少 / occasional 偶尔（最高档）；和场景卖萌档取较低者，淡档恒不卖萌",
+            "group": "活人感",
+        },
+    )
+    style_group_unified: bool = field(
+        default=False,
+        metadata={
+            "description": "口吻统一：true = 群聊与私聊用同一套场景档位（群里也可以偶尔俏皮，上限仍取 style_group_register_cap 与 style_cute_cap；"
+            "认真求助 / 难过 / 问看法 / 被恶意对待时照样不卖萌；群→私聊关心在生病 / 心情差 / 危机时仍淡档）；false = 群聊用更收敛的一列（3c6e6e6）",
+            "group": "活人感",
+        },
+    )
+    style_casual_punctuation: bool = field(
+        default=False,
+        metadata={
+            "description": "随性标点：true = 闲聊类回复（含主动消息）去掉每段末尾的句号，并改用随性语气版示例库；"
+            "代码 / 列表 / 步骤 / 技术话题 / 长段说明不处理，问号感叹号省略号不动；false = 3c6e6e6 行为",
+            "group": "活人感",
+        },
+    )
+    style_examples_path: str = field(
+        default="",
+        metadata={
+            "description": "风格示例库覆盖路径（JSON，结构同 iris_memory/style/style_examples_v1.json）；空 = 用代码自带种子库；读失败回退种子库",
+            "group": "活人感",
+        },
+    )
+    style_downgrade_on_feedback: bool = field(
+        default=True,
+        metadata={
+            "description": "被说做作/装可爱/嗲/翻译腔后，本段对话保持淡档且不卖萌",
+            "group": "活人感",
+        },
+    )
+    style_inject_proactive: bool = field(
+        default=True,
+        metadata={
+            "description": "主动消息 system 末尾追加 style 段（固定中档，群聊再取群上限），生成稿命中 StyleGuard 操纵句 MAN-* 时不发送（P1-4；需 style_anime_register 非 off）",
+            "group": "活人感",
+        },
+    )
+
+    # learning 反自我强化（ROADMAP P1-3，口吻附录 §5.5）
+    learning_pattern_rotation: bool = field(
+        default=True,
+        metadata={
+            "description": "表达模式注入改为加权随机 + 冷却轮换（仍按注入计数，不改表）；衰减的'未使用'判定窗口相应放宽，避免轮换后被误清空。false = 按命中数取前 N（旧行为）",
+            "group": "活人感",
+        },
+    )
+    learning_few_shot_scene_filter: bool = field(
+        default=True,
+        metadata={
+            "description": "few-shot 按本轮场景过滤（技术/难过等淡档场景不注入浓档样例）+ 冷却轮换。false = 取最新 N 条（旧行为）",
+            "group": "活人感",
+        },
+    )
+    learning_expression_tail_particle_rule: bool = field(
+        default=False,
+        metadata={
+            "description": "true = 保留旧的表达模式抽取（语气词结尾句专门收、反应词开头照收）；false = 剥掉句尾语气词后不足 4 字不收、纯反应词开头不收",
+            "group": "活人感",
+        },
+    )
+    learning_inject_paused: bool = field(
+        default=False,
+        metadata={
+            "description": "只暂停 learning 注入（采集与审查照常）；漂移告警或人工处置时使用",
+            "group": "活人感",
+        },
+    )
+
+    # 活人感 P1-8：主动候选池 + 硬闸门 + 归因与退避（设计 §7）
+    lifelike_initiative_mode: str = field(
+        default="on",
+        metadata={
+            "description": "主动候选池（P1-8）：off = 只用事项候选（旧行为）/ shadow = 只计算闸门与排序并记录，不交给决策 / on = 合并候选池",
+            "group": "活人感·主动",
+        },
+    )
+    lifelike_pool_empty_window: bool = field(
+        default=True,
+        metadata={
+            "description": "主动候选池（P1-8）：候选池里有通过闸门的可推送候选（如群→私聊关心）时，私聊窗口为空也允许调度（与 lifelike_proactive_empty_window 无关）；false = 空窗一律不调度（P0 行为）",
+            "group": "活人感·主动",
+        },
+    )
+    lifelike_push_daily_cap: int = field(
+        default=3,
+        metadata={"description": "主动推送（候选池）滚动 24 小时上限，另受现有每日主动上限约束", "group": "活人感·主动"},
+    )
+    lifelike_push_min_gap_hours: float = field(
+        default=3.0,
+        metadata={"description": "两次主动推送之间的最小间隔(小时)；上一条 6 小时无回复时翻倍", "group": "活人感·主动"},
+    )
+    lifelike_passive_only_types: str = field(
+        default="life_share,group_topic",
+        metadata={"description": "只顺口提、不推送的候选类型（逗号分隔）", "group": "活人感·主动"},
+    )
+
+    # 活人感 U8：主人私聊自由主动（用户拍板"私聊限制关掉，让她自由决定什么时候私聊我"）
+    lifelike_proactive_freedom: bool = field(
+        default=False,
+        metadata={
+            "description": "主人私聊自由主动：true = 条数上限 / 最小间隔 / 未回复暂停 / 静音与活动窗口推迟 / "
+            "收尾冷却 / 候选池 push 上限与间隔 / 关心桥每日每周上限对主人私聊全部失效，改为定时评估、由她自己决定；"
+            "仍保留同内容/同话题去重、硬底线、熔断、主人叫停、冷静期试探句与操纵/讨要回复句拦截（后者不随口吻开关关闭）；群聊不受影响。受 lifelike_enable 总开关控制",
+            "group": "活人感·主动",
+        },
+    )
+    lifelike_freedom_eval_minutes: int = field(
+        default=20,
+        metadata={"description": "自由主动：多久评估一次要不要主动发（分钟，±20% 抖动，5–120）", "group": "活人感·主动"},
+    )
+    lifelike_freedom_owner_quiet_minutes: int = field(
+        default=10,
+        metadata={"description": "自由主动：主人最后一条消息之后至少静默多久才评估（分钟，0–120；避免插话）", "group": "活人感·主动"},
+    )
+    lifelike_freedom_min_gap_minutes: int = field(
+        default=10,
+        metadata={"description": "自由主动技术安全网：两次主动之间的硬底线（分钟，5–240；防故障连发）", "group": "活人感·主动"},
+    )
+    lifelike_freedom_breaker_24h: int = field(
+        default=20,
+        metadata={"description": "自由主动技术安全网：主人最后一条消息之后、滚动 24 小时内的主动达到此条数即熔断并记 ERROR（主人一回话即归零；3–100）", "group": "活人感·主动"},
+    )
+    lifelike_freedom_hush_hours: float = field(
+        default=12.0,
+        metadata={"description": "自由主动：主人说「别发了 / 安静点 / 别烦我」后暂停主动的小时数（1–72；说「可以找我了」立即解除）", "group": "活人感·主动"},
+    )
+
+    # 活人感 U9：白名单群自由搭话（用户拍板"让她自主决定跟白名单群里的群友搭话吧，不要加限制了"）
+    lifelike_group_freedom: bool = field(
+        default=False,
+        metadata={
+            "description": "白名单群自由搭话：true = 平台 id_whitelist 里的群（不含频道 / silent_sessions / 主人频道）任何人的发言"
+            "都在一阵消息停下来后交给她决定要不要搭话，群里安静一段时间后也可以自己开话题；取消冷却闸门 / 采样 / 频率上限 / "
+            "仅点名回应 / 跟进时长 / 质量分 / 静音时段；保留去重、硬底线、连续无人说话熔断、群里叫停、私聊内容不进群、频道不发。"
+            "受 lifelike_enable 总开关控制",
+            "group": "活人感·群聊",
+        },
+    )
+    lifelike_gf_debounce_seconds: int = field(
+        default=45,
+        metadata={"description": "群聊自由搭话：一阵消息停下来多少秒后合并判断一次（10–300；窗口内只做一次决策）", "group": "活人感·群聊"},
+    )
+    lifelike_gf_initiate_quiet_minutes: int = field(
+        default=45,
+        metadata={"description": "群聊自由搭话：群里安静多少分钟后才考虑自己开话题（10–720）", "group": "活人感·群聊"},
+    )
+    lifelike_gf_initiate_eval_minutes: int = field(
+        default=45,
+        metadata={"description": "群聊自由搭话：开话题评估节奏（分钟，±20% 抖动；15–360）", "group": "活人感·群聊"},
+    )
+    lifelike_gf_floor_seconds: int = field(
+        default=120,
+        metadata={"description": "群聊自由搭话技术安全网：同一群两次主动搭话之间至少间隔多少秒（被 @ / 回复 / 叫名字不受限；60–1800）", "group": "活人感·群聊"},
+    )
+    lifelike_gf_breaker_consecutive: int = field(
+        default=2,
+        metadata={"description": "群聊自由搭话熔断：她连续主动发言、中间没有任何人说话达到此条数 → 暂停主动直到有人说话（2–10）", "group": "活人感·群聊"},
+    )
+    lifelike_gf_hush_owner_hours: float = field(
+        default=6.0,
+        metadata={"description": "群聊：主人在群里叫她安静 / 别说话后暂停主动搭话的小时数（0.5–72；主人说「可以说话了」解除）", "group": "活人感·群聊"},
+    )
+    lifelike_gf_hush_member_hours: float = field(
+        default=2.0,
+        metadata={"description": "群聊：群友在群里对她说安静 / 别说话后暂停主动搭话的小时数（0.5–24）", "group": "活人感·群聊"},
+    )
+    lifelike_chat_drive: str = field(
+        default="off",
+        metadata={
+            "description": "聊天欲望档位 off / low / medium / high：只在主人私聊自由主动（U8）/ 群聊自由搭话（U9）打开时生效——"
+            "决策措辞里开口的倾向（off = 3c6e6e6 原措辞；low 略多一点；medium 看到能接的话题或想到对方就常说一句、仍挑时机；"
+            "high 大多数时候倾向开口）、评估节奏（medium：私聊约 15 分钟、群安静约 30 分钟后考虑开话题）、她自己请求冷却的上限；"
+            "去重 / 硬底线 / 熔断 / 叫停 / MAN 拦截不变。受 lifelike_enable 总开关控制",
+            "group": "活人感·主动",
+        },
+    )
+    lifelike_member_nickname: str = field(
+        default="off",
+        metadata={
+            "description": "群友常用称呼 off / on：on = 从授权群公开发言里学群友的常用叫法（别人怎么叫 TA），学不到用规则从显示名生成简称；"
+            "群聊与私聊提到群友时注入称呼表并要求不用完整显示名、不乱起外号（称呼级信息；墓碑 / 别记我的人不学）。受 lifelike_enable 总开关控制",
+            "group": "活人感·群聊",
+        },
+    )
+    lifelike_sticker_auto_learn: str = field(
+        default="off",
+        metadata={
+            "description": "表情包自动学习 off / on（U19）：on = 主人在与她的私聊里发的贴纸（复用贴纸理解的描述缓存，不新增视觉调用）"
+            "自动按 emoji + 描述推导标签与适用场合加入表情库（推不出时一次廉价模型调用，走活人感预算、模块日上限），"
+            "并记下主人用它的场合概括（不存原话）；不学群友 / 群里 / 频道；容量见 lifelike_sticker_learn_max，"
+            "超出淘汰主人最久没用的自动条目（手动 /sticker add 的永不淘汰）；/sticker learn on|off 可暂停。受 lifelike_enable 总开关控制",
+            "group": "活人感·表情包",
+        },
+    )
+    lifelike_sticker_use: str = field(
+        default="off",
+        metadata={
+            "description": "表情包使用意愿 off / on（U19）：on = 新的表情包说明（标签 + 适用场合 + 主人常用场合，按主人近 7 天"
+            "私聊发贴纸的多少给出很少 / 有时 / 经常的文字档位，与 lifelike_chat_drive 联动）；接受 [贴纸:标签] 写法与近似标签；"
+            "论坛话题与主动消息也可配贴纸；同会话两张贴纸至少间隔 60 秒（防故障底线，off 时 120 秒）。受 lifelike_enable 总开关控制",
+            "group": "活人感·表情包",
+        },
+    )
+    lifelike_sticker_learn_groups: str = field(
+        default="off",
+        metadata={
+            "description": "表情包也学主人在群里的用法 off / on（U20，需同时打开 lifelike_sticker_auto_learn）：on = 主人本人在白名单群"
+            "（与群聊自由搭话资格相同：平台 id_whitelist 里的群，排除频道、silent_sessions、主人频道）里发的贴纸也学进表情库；"
+            "群友的、转发的、频道里的一律不学；分别统计主人在私聊 / 群里发贴纸的多少与场合短语（只计数与短语，不存原话、不存群友信息），"
+            "群聊说明的档位用主人在群里的频率；主人在群里亲自用过的贴纸可视为群里可用（真人 / 骂人 / 色情 / 政治等硬类别除外）。"
+            "受 lifelike_enable 总开关控制",
+            "group": "活人感·表情包",
+        },
+    )
+    lifelike_sticker_learn_max: int = field(
+        default=60,
+        metadata={"description": "自动学到的表情包容量上限（10–200；手动添加的不计入、不淘汰）", "group": "活人感·表情包"},
+    )
+    identity_bot_names: str = field(
+        default="",
+        metadata={
+            "description": "角色身份：她被叫的名字（逗号分隔，如 小白,xiaobai）。用于判断一句话是不是在说她、她是不是在用名字自称等；"
+            "留空则这类规则只认\"你\"",
+            "group": "角色身份",
+        },
+    )
+    identity_owner_names: str = field(
+        default="",
+        metadata={
+            "description": "角色身份：主人的称呼（逗号分隔，第一个作为默认称呼）。用于回怼时识别冲主人、称呼提示、风格守卫；留空则称\"主人\"",
+            "group": "角色身份",
+        },
+    )
+    lifelike_world_interests: str = field(
+        default="",
+        metadata={"description": "虚拟日常（lifelike_world_mode）里她的喜好，逗号分隔；留空则不提喜好", "group": "角色身份"},
+    )
+    persona_reference_file: str = field(
+        default="",
+        metadata={
+            "description": "可选：参照角色文件（JSON，相对插件数据目录）。人设以某部作品的角色为性格参照但不许照搬时，"
+            "在这里写作品识别正则与禁止照搬的口癖/设定梗；格式见 iris_memory/identity.py",
+            "group": "角色身份",
+        },
+    )
+    lifelike_counter_mode: str = field(
+        default="off",
+        metadata={
+            "description": "被恶意对待时反击 off / on：on = 规则初筛出冲她（或冲主人）的难听话后，群里不等去抖立即回应、"
+            "由回复模型分辨玩笑与恶意，恶意时简短有力地回击；底线由提示与发送前规则双重兜底（脏话 / 身份攻击 / 威胁 / "
+            "隐私 / 性内容 / 煽动围攻一律删掉），同一人纠缠超过轮数上限后不再理会。受 lifelike_enable 总开关控制",
+            "group": "活人感·群聊",
+        },
+    )
+    lifelike_counter_owner_names: str = field(
+        default="",
+        metadata={"description": "反击：识别\"冲主人说难听话\"用的主人称呼（逗号分隔；另外回复主人消息也算）；留空 = 用 identity_owner_names", "group": "活人感·群聊"},
+    )
+    lifelike_counter_max_rounds: int = field(
+        default=3,
+        metadata={"description": "反击：同一个人 30 分钟内最多回应几轮恶意（最后一轮一句话收尾，之后不再理会；2–6；主人除外）", "group": "活人感·群聊"},
+    )
+
+    # 活人感 P1-12：群→私聊关心桥（设计 §7.9；D14 两个采集群授权、推送开）
+    lifelike_care_bridge_mode: str = field(
+        default="on",
+        metadata={
+            "description": "群→私聊关心桥：off 关闭 / shadow 只检测并记录 care_signals、不入队 / on 入候选池（推送还需 lifelike_initiative_mode=on）",
+            "group": "活人感·关心桥",
+        },
+    )
+    lifelike_care_bridge_groups: str = field(
+        default="*",
+        metadata={
+            "description": "授权群 chat_id（逗号分隔）；* = continuity.observe_chat_ids 中的全部群。最终还要与 observe_chat_ids、平台 id_whitelist 取交集并去掉主人频道",
+            "group": "活人感·关心桥",
+        },
+    )
+    lifelike_care_bridge_categories: str = field(
+        default="tired,sick,overtime,mood_low,good_news",
+        metadata={"description": "关心类别（逗号分隔）", "group": "活人感·关心桥"},
+    )
+    lifelike_care_bridge_push: bool = field(
+        default=True,
+        metadata={"description": "false = 群里看到的近况只在她下次私聊时顺口提，不主动推送", "group": "活人感·关心桥"},
+    )
+    lifelike_care_include_owner_channel: bool = field(
+        default=False,
+        metadata={"description": "主人频道帖是否也作为关心来源（默认否：频道不算'群里'）", "group": "活人感·关心桥"},
+    )
+    lifelike_care_llm: bool = field(
+        default=True,
+        metadata={"description": "规则拿不准的句子是否送廉价模型复核（只送主人自己的话，计入每日预算）", "group": "活人感·关心桥"},
+    )
+    lifelike_care_llm_daily_cap: int = field(
+        default=8,
+        metadata={"description": "关心桥廉价模型每日调用上限（另受 lifelike_budget_cheap_* 总预算约束）", "group": "活人感·关心桥"},
+    )
+
+    # 活人感 P1-6 / P1-11：关系事件溯源 + 可恢复反馈 + 关系渐进（docs/lifelike-20261103 设计 §5）
+    lifelike_relation_mode: str = field(
+        default="shadow",
+        metadata={
+            "description": "关系事件溯源与可恢复反馈（P1-6）：off 不读写任何行（表由 continuity.db v3 迁移统一建好） / shadow 只记录事件与模式并写日志、不注入不改行为 / on 主人私聊注入<你们之间>，并接入主动候选池（U2：冷静期只影响语气/内容/排序，按 U8 不拦截、不减少主动）",
+            "group": "活人感",
+        },
+    )
+    lifelike_relation_levels: str = field(
+        default="soften,boundary",
+        metadata={
+            "description": "可恢复反馈启用的级别（逗号分隔）；P1 只认 soften、boundary（拍板 D8，最高 2 级）",
+            "group": "活人感",
+        },
+    )
+    lifelike_relation_detector_daily_cap: int = field(
+        default=10,
+        metadata={
+            "description": "关系检测廉价模型确认每日调用上限（另受 lifelike_budget_cheap_* 全局硬预算约束；0=只用规则，负向/倾诉事件不写）",
+            "group": "活人感",
+        },
+    )
+    lifelike_bond_mode: str = field(
+        default="shadow",
+        metadata={
+            "description": "关系渐进（P1-11）：off / shadow 每日折叠只写 proposed 转移 / on 注入阶段行并驱动联动（熟悉的朋友起 life_share 可推送、私聊两格卖萌放宽到偶尔、趋同档位上限；关心桥推送不读阶段，U4）；实际取值不高于 lifelike_relation_mode",
+            "group": "活人感",
+        },
+    )
+    lifelike_bond_start_stage: str = field(
+        default="s1",
+        metadata={
+            "description": "关系渐进起点阶段 s1..s4（s1=聊得来的网友，等于现网相处方式）",
+            "group": "活人感",
+        },
+    )
+    lifelike_bond_promote_approval: str = field(
+        default="notify",
+        metadata={
+            "description": "阶段升降是否需主人批准：notify 直接生效只在 /iris_rel bond 可见 / manual 先写 proposed，/iris_rel bond approve 后生效",
+            "group": "活人感",
+        },
+    )
+
+    # 活人感 P1-7 用户认知 / forget / dream 归档（docs/lifelike-20261103 §6.2/6.5/6.6）
+    lifelike_memory_mode: str = field(
+        default="shadow",
+        metadata={
+            "description": "用户认知 user_beliefs（P1-7）：off 关闭 / shadow 不注入、默认也不改会话抽取 prompt（见 lifelike_memory_shadow_extract），只保留查看/forget 命令与维护 / on 随会话抽取记录并在主人私聊注入<你记得的她>",
+            "group": "活人感",
+        },
+    )
+    lifelike_memory_shadow_extract: bool = field(
+        default=False,
+        metadata={
+            "description": "shadow 下是否把 beliefs 并入 P0-4 会话抽取（会改变现网抽取 prompt 与输出结构、增加 token）；false=shadow 时抽取 prompt 与 P0-4 原版一致",
+            "group": "活人感",
+        },
+    )
+    lifelike_memory_inference_inject: str = field(
+        default="hedged",
+        metadata={
+            "description": "推测性认知注入：off 一律不注入 / hedged 只注入'较确定'以上并带'没确认过'措辞（仅 lifelike_memory_mode=on 时生效）",
+            "group": "活人感",
+        },
+    )
+    lifelike_dream_contradiction_archive: bool = field(
+        default=True,
+        metadata={
+            "description": "梦境冲突消解：被替代的 L2 记忆归档并标 superseded（可恢复），不再硬删（false=旧行为硬删）",
+            "group": "活人感",
+        },
+    )
+    # 活人感 P1-13 群友认知（§6.8）与隐私收口 R1/R2（D16）
+    lifelike_member_mode: str = field(
+        default="shadow",
+        metadata={
+            "description": "群友认知（P1-13）：off 关闭 / shadow 只从授权群公开发言建档、不注入 / on 主人私聊提起群友时注入印象",
+            "group": "活人感",
+        },
+    )
+    lifelike_member_groups: str = field(
+        default="",
+        metadata={
+            "description": "群友认知授权群（逗号分隔群 id；* = 全部采集群；*whitelist = 平台 id_whitelist 里的全部群，动态读取，可与显式 id 混写）；还须在 continuity.observe_chat_ids 中，不含主人频道/私聊；同一 Telegram 账号跨群合并为一份印象；空=不产生数据",
+            "group": "活人感",
+        },
+    )
+    lifelike_member_require_owner_present: str = field(
+        default="auto",
+        metadata={
+            "description": "授权群是否还要求主人 60 天内在群里发过言：auto=显式群列表要求、通配（* / *whitelist）不要求 / true / false",
+            "group": "活人感",
+        },
+    )
+    lifelike_private_l2_filter: bool = field(
+        default=True,
+        metadata={
+            "description": "私聊注入的 L2 群记忆只取授权群 / global，且过敏感过滤（隐私审查 R1；false=旧行为）",
+            "group": "活人感",
+        },
+    )
+    lifelike_private_l2_groups: str = field(
+        default="",
+        metadata={
+            "description": "私聊 L2 允许的群（逗号分隔；支持 * / *whitelist，按群友认知同一授权规则解析）；空=沿用 lifelike_member_groups",
+            "group": "活人感",
+        },
+    )
+    lifelike_group_global_memory_guard: bool = field(
+        default=True,
+        metadata={
+            "description": "群事件里禁止 LLM 自选 save_memory(scope=global)，全局作用域只认主人在 WebUI 设置（R2/D16；false=旧行为）",
+            "group": "活人感",
+        },
+    )
+
+    # 活人感 P1-5：生活系统（ROADMAP §2.1：P1/P2 子模块受 lifelike_enable 总开关控制）
+    lifelike_enable: bool = field(
+        default=True,
+        metadata={
+            "description": "活人感 P1/P2 总开关：false 时所有 P1/P2 lifelike_* 子模块视为 off（P0 修复项与 style_* 不受影响）",
+            "group": "活人感",
+        },
+    )
+    lifelike_world_mode: str = field(
+        default="shadow",
+        metadata={
+            "description": "生活系统（P1-5）：off 关闭 / shadow 生成计划、推进状态、核对自述并记录，不注入 prompt / on 注入<她的今天>并落实核对",
+            "group": "活人感",
+        },
+    )
+    lifelike_world_claim_audit: bool = field(
+        default=True,
+        metadata={
+            "description": "生活系统：回复/主动消息发出后核对她的自述（ClaimAuditor，主人私聊；廉价模型计入日预算）",
+            "group": "活人感",
+        },
+    )
+    lifelike_world_plan_llm: bool = field(
+        default=True,
+        metadata={
+            "description": "生活系统：DayPlanner 每天用廉价模型提议一次（false=只用模板）",
+            "group": "活人感",
+        },
+    )
+
 
 @dataclass
 class LearningConfig:
@@ -1202,6 +1848,41 @@ class PersonaEvolutionConfig:
 
 
 @dataclass
+class ContinuityConfig:
+    """连续性层配置（用户可见选项，与 _conf_schema.json 的 continuity 分组一致）
+
+    运行时由 ``iris_memory.continuity.service.ContinuityConfig.from_config``
+    统一做类型收敛与范围钳制；``enable=false`` 为软回滚。
+    """
+
+    enable: bool = True
+    items_enable: bool = True
+    proactive_topics_enable: bool = True
+    closure_enable: bool = True
+    batching_enable: bool = True
+    channel_ingest_enable: bool = False
+    digest_enable: bool = False
+    observe_chat_ids: List[str] = field(default_factory=list)
+    owner_channel_ids: List[str] = field(default_factory=list)
+    merge_quiet_ms: int = 1200
+    merge_cap_ms: int = 2000
+    explicit_wait_timeout_s: int = 180
+    closure_cooldown_minutes: int = 120
+    inject_max_items: int = 3
+    inject_max_chars: int = 600
+    extract_debounce_s: int = 6
+    extract_timeout_s: int = 30
+    extract_queue_max: int = 50
+    digest_interval_hours: int = 3
+    sticker_understanding_enable: bool = True
+    image_understanding_enable: bool = True
+    sticker_send_enable: bool = True
+    sticker_groups_enable: bool = False
+    sticker_scope_unified: bool = False
+    sticker_describe_daily_cap: int = 100
+
+
+@dataclass
 class Defaults:
     """所有默认配置的统一入口
 
@@ -1220,6 +1901,7 @@ class Defaults:
     persona_evolution: PersonaEvolutionConfig = field(
         default_factory=PersonaEvolutionConfig
     )
+    continuity: ContinuityConfig = field(default_factory=ContinuityConfig)
     hidden: HiddenConfig = field(default_factory=HiddenConfig)
 
     def get_by_flat_key(self, flat_key: str) -> Optional[object]:

@@ -34,6 +34,39 @@ _SYSTEM_PROMPT = (
 )
 
 
+_VERDICT_FORMAT = (
+    '[{"id": 数字, "type": "pair或pattern", "pass": true或false, "reason": "一句话理由"}]'
+)
+
+# learning_cutesy_gate=true 时追加的审查标准（口吻附录 §5.4 (2)；审查端是判断者，可以提作品名）
+_CUTESY_CRITERIA = (
+    "还要拒绝做作或场合不对、过量的卖萌：每句都带语气词、叠词、用自己名字自称或“人家”、",
+    "多个“～”或颜文字、日语音译；在认真求助、难过、问看法时卖萌；低幼；撒娇留人；接连卖萌；",
+    "对群友撒娇。偶尔一次、场合对的小卖萌不算过度卖萌，不要因为可爱就判拒绝。",
+    "拒绝固定口头禅：和常见回复用同一个开头或结尾套话。",
+    "拒绝搬用动漫作品角色的口头禅、台词、自称、称呼或设定梗。",
+    "群友的梗和玩笑、自然口语可以通过；固定口头禅不算优点。",
+)
+
+REJECT_TYPES = (
+    "low", "sensitive", "preachy", "fence", "bookish", "cutesy", "catchphrase", "copied", "none",
+)
+
+_VERDICT_FORMAT_CUTESY = (
+    '[{"id": 数字, "type": "pair或pattern", "pass": true或false, '
+    '"reject_type": "low|sensitive|preachy|fence|bookish|cutesy|catchphrase|copied|none", '
+    '"reason": "一句话理由"}]'
+)
+
+
+def cutesy_gate_enabled() -> bool:
+    """HiddenConfig ``learning_cutesy_gate``（默认 true；配置不可读时按默认）"""
+    try:
+        return bool(get_config().get("learning_cutesy_gate", True))
+    except Exception:
+        return True
+
+
 class LearningReviewer:
     """学习产物攒批审查器
 
@@ -189,12 +222,27 @@ class LearningReviewer:
         self, pairs: List[Dict[str, Any]], patterns: List[Dict[str, Any]]
     ) -> str:
         """拼接批量审查 prompt"""
+        cutesy = cutesy_gate_enabled()
         lines = [
-            "请逐条审查以下群聊学习内容，判断是否适合作为机器人的回复风格参考。",
+            "请逐条审查以下聊天学习内容，判断是否适合作为机器人的回复风格参考。"
+            if cutesy
+            else "请逐条审查以下群聊学习内容，判断是否适合作为机器人的回复风格参考。",
             "拒绝标准：低质量（无意义/乱码）、敏感（政治/色情/辱骂/隐私）、",
             "复读刷屏、明显不像真实群聊对话。",
-            "",
+            "机器人的回复还要拒绝这些语气（避免越学越偏）：说教或指挥人（别…/该…/建议你…、",
+            "提醒休息、教人怎么提问）、纠正别人的称呼或玩笑、两边都不得罪的和稀泥",
+            "（各有道理/要看情况/不是非黑即白/没法一概而论）、绕弯的书面比喻和客服腔。",
         ]
+        if cutesy:
+            lines += list(_CUTESY_CRITERIA)
+            from ..identity import reference_text
+
+            note = reference_text("reviewer_note")
+            if note:
+                lines.append(note)
+        else:
+            lines.append("群友的梗、口头禅、玩笑和自然的口语可以通过。")
+        lines.append("")
         for p in pairs:
             lines.append(
                 f"[pair id={p['id']}] 用户：{self._truncate(p['user_text'])}"
@@ -208,7 +256,7 @@ class LearningReviewer:
         lines += [
             "",
             "对每一条输出裁决，格式为 JSON 数组：",
-            '[{"id": 数字, "type": "pair或pattern", "pass": true或false, "reason": "一句话理由"}]',
+            _VERDICT_FORMAT_CUTESY if cutesy else _VERDICT_FORMAT,
             "只输出 JSON 数组，覆盖上面列出的所有条目。",
         ]
         return "\n".join(lines)
@@ -256,6 +304,8 @@ class LearningReviewer:
         approved_patterns: List[int] = []
         disabled_patterns: List[int] = []
 
+        reject_counts: Dict[str, int] = {}
+
         for v in verdicts:
             try:
                 vid = int(v.get("id"))
@@ -263,10 +313,18 @@ class LearningReviewer:
                 continue
             vtype = str(v.get("type") or "")
             passed = bool(v.get("pass"))
+            matched = (vtype == "pair" and vid in pair_ids) or (
+                vtype == "pattern" and vid in pattern_ids
+            )
             if vtype == "pair" and vid in pair_ids:
                 (approved_pairs if passed else disabled_pairs).append(vid)
             elif vtype == "pattern" and vid in pattern_ids:
                 (approved_patterns if passed else disabled_patterns).append(vid)
+            # reject_type 只在汇总日志里计数（不改表；口吻附录 §5.4 (2) 方案 (a)）
+            if matched and not passed and "reject_type" in v:
+                rt = str(v.get("reject_type") or "").strip().lower()
+                rt = rt if rt in REJECT_TYPES else "other"
+                reject_counts[rt] = reject_counts.get(rt, 0) + 1
 
         expected = len(
             approved_pairs + disabled_pairs + approved_patterns + disabled_patterns
@@ -334,4 +392,10 @@ class LearningReviewer:
             f"学习审查完成：pair 通过 {len(approved_pairs)} 拒绝 {len(disabled_pairs)}，"
             f"pattern 通过 {len(approved_patterns)} 拒绝 {len(disabled_patterns)}"
             + (f"，{skipped} 条因审查期间被修改而跳过回写" if skipped else "")
+            + (
+                "，reject_type "
+                + " ".join(f"{k}={reject_counts[k]}" for k in sorted(reject_counts))
+                if reject_counts
+                else ""
+            )
         )

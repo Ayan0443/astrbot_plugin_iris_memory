@@ -10,6 +10,7 @@ from typing import List, Optional, Dict
 from ..core import get_logger
 from ..config import get_config
 from .storage import ProfileStorage, profile_lock
+from ..utils.log_redact import text_for_log
 from .models import (
     UserProfile,
     UpdateTier,
@@ -529,7 +530,7 @@ class UserProfileManager:
             await self._storage.save_user_profile(
                 profile, group_id, persona_id=persona_id
             )
-            logger.info(f"添加用户禁忌话题: {user_id} -> {topic}")
+            logger.info(f"添加用户禁忌话题: {user_id} -> {text_for_log(topic, len(str(topic)))}")
 
     @profile_lock("user")
     async def add_important_event(

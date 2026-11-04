@@ -690,7 +690,9 @@ class LearningStorage:
             )
             self._db.commit()
 
-    def decay_patterns(self, decay_days: int, max_count: int) -> int:
+    def decay_patterns(
+        self, decay_days: int, max_count: int, *, disuse_days: Optional[int] = None
+    ) -> int:
         """衰减淘汰表达模式
 
         规则：
@@ -699,11 +701,16 @@ class LearningStorage:
         3. 总量（含 approved）超过 max_count 时，按命中率（hit_count 升序）
            淘汰超出的部分。
 
+        ``disuse_days``（P1-3）：规则 1、2 的"未使用"窗口改用这个天数。
+        注入改为加权随机轮换后，"没被抽到"不再代表"没用"，按旧窗口
+        会把大量已通过模式清掉；None = 沿用 decay_days（旧行为）。
+
         Returns:
             删除的总条数
         """
         now = time.time()
-        cutoff = now - decay_days * 86400
+        window = decay_days if disuse_days is None else max(decay_days, int(disuse_days))
+        cutoff = now - window * 86400
         removed = 0
         with self._lock:
             cur = self._db.execute(
@@ -2036,6 +2043,19 @@ class LearningStorage:
                 f"SELECT COUNT(*) AS c FROM {table}{where}", params
             ).fetchone()
             return int(row["c"])
+
+    def find_few_shot_ids(self, keyword: str, user_id: str, limit: int = 500) -> List[int]:
+        """活人感 P1-7 forget：某用户的 few-shot 样本中含关键词的 id（只读，不返回正文）"""
+        kw = str(keyword or "").strip()
+        if not kw:
+            return []
+        like = f"%{kw}%"
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id FROM few_shot WHERE user_id=? AND (user_text LIKE ? OR bot_text LIKE ?) LIMIT ?",
+                (str(user_id), like, like, int(limit)),
+            ).fetchall()
+            return [int(r[0]) for r in rows]
 
     def delete_rows(self, table: str, ids: List[int]) -> int:
         """按 id 批量删除条目

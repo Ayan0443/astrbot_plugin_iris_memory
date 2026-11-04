@@ -13,6 +13,7 @@ from typing import List, Optional, TYPE_CHECKING
 from ..core import get_logger
 from .models import ImageInfo, ParseResult
 from ..llm_modules import IMAGE_PARSING
+from ..utils.log_redact import text_for_log
 from .recorder_bridge import MessageRecorderBridge
 from .security import (
     fetch_safe_image_bytes,
@@ -205,7 +206,7 @@ class ImageParser:
             )
 
             if self._is_unable_to_describe(response):
-                logger.info(f"LLM 无法识别图片内容，视为解析失败：{response[:80]}")
+                logger.info(f"LLM 无法识别图片内容，视为解析失败：{text_for_log(response, 80)}")
                 return ParseResult(
                     image_info=image_info,
                     success=False,

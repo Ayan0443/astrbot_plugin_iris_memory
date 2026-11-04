@@ -9,7 +9,22 @@ from typing import Any
 from .config import ConfigManager
 from .parser import Decision, parse_decision
 from .perception import ContextPackager, SlidingWindow
-from .prompts import MOTIVE_INSTRUCTIONS, VALID_MOTIVES, WILLINGNESS_PROMPTS
+from .prompts import (
+    AVOID_TOPICS_INSTRUCTION,
+    CANDIDATES_INSTRUCTION,
+    MOTIVE_INSTRUCTIONS,
+    PRIVATE_DECISION_SYSTEM,
+    GROUP_CHIME_INSTRUCTION_FREE,
+    GROUP_HOSTILE_INSTRUCTION,
+    GROUP_INITIATE_INSTRUCTION_FREE,
+    PRIVATE_INITIATE_INSTRUCTION,
+    group_free_system,
+    private_free_instruction,
+    private_free_system,
+    VALID_MOTIVES,
+    WILLINGNESS_PROMPTS,
+    TRIGGER_INSTRUCTIONS,
+)
 from .state import StateManager, ThreadAnchor
 from .time_hint import wrap_system_reminder
 from ..llm_modules import proactive_decision_module
@@ -154,6 +169,114 @@ class DecisionRequest:
     wake: str  # "message" | "timer"
     motive: str  # "chime_in" | "follow_up" | "initiate" | "watch"
     quiet_minutes: int = 0  # 仅 initiate 使用
+    # 以下仅在接入连续性桥接时由 initiate 通路设置；默认值保持原行为
+    private: bool = False  # 私聊措辞
+    candidates: list[dict[str, Any]] | None = None  # 连续性候选事项（≤3）
+    now: float | None = None  # 候选时间状态的参考时刻
+    avoid_topics: list[str] | None = None  # 「不要主动提起」话题（只有话题文本）
+    trigger: str = ""  # 群聊门控触发源："owner" | "name" | "follow" | ""
+    trigger_user: str = ""
+    # 活人感 U8：自由主动时的 <facts> 块（只含时间类事实）；空 = 原有私聊决策 prompt
+    freedom_facts: str = ""
+    # 活人感 U9：白名单群自由搭话（chime_in / initiate 使用群聊自由版 system 与指令，附 <facts>）
+    group_free: bool = False
+    # 聊天欲望档位 off/low/medium/high（只在 U8 freedom_facts 非空或 group_free 时生效；off = 原措辞）
+    chat_drive: str = "off"
+    # 决定开口时 drifted / cooldown 不再把 speak 改成 none（U8 / U9 且档位不是 off）
+    speak_wins: bool = False
+    # 她自己请求冷却 / 暂停的上限（分钟，只用于指令措辞；0 = 不写）
+    self_pause_cap: int = 0
+
+
+_CANDIDATE_KIND_LABELS = {
+    "plan": "计划",
+    "pending_result": "等结果",
+    "unfinished_topic": "没聊完的话题",
+    "bot_promise": "你答应过的事",
+    "interest_question": "好奇",
+    "note": "记着的事",
+    # 活人感 P1-8 候选池类型（只在 lifelike_initiative_mode=on 时出现）
+    "group_care": "群里看到的近况",
+    "life_share": "自己的日常",
+    "moment_followup": "共同经历的后续",
+    "owner_post": "她频道的新帖",
+    "group_topic": "群里的话题",
+    "confirm_inference": "想确认的事",
+    "next_opening": "上次留下的话头",
+}
+_WEEKDAYS = "一二三四五六日"
+
+
+def _fmt_local(ts: float) -> str:
+    lt = time.localtime(float(ts))
+    return f"{lt.tm_mon}月{lt.tm_mday}日(周{_WEEKDAYS[lt.tm_wday]})"
+
+
+def _one_line(text: Any, limit: int) -> str:
+    s = " ".join(str(text or "").split())
+    return s[:limit]
+
+
+def build_candidates_block(candidates: list[dict[str, Any]], now: float | None = None) -> str:
+    """构建 <candidates> 块（id / kind / topic / summary / 时间状态），无候选时返回空串。"""
+    if not candidates:
+        return ""
+    now = time.time() if now is None else float(now)
+    lines = []
+    for item in candidates:
+        item_id = str(item.get("item_id") or "").strip()
+        if not item_id:
+            continue
+        kind = str(item.get("kind") or "")
+        parts = [
+            f"id={item_id}",
+            f"类型:{_CANDIDATE_KIND_LABELS.get(kind, kind)}",
+            f"话题:{_one_line(item.get('topic'), 40)}",
+        ]
+        summary = _one_line(item.get("summary"), 160)
+        if summary:
+            parts.append(f"摘要:{summary}")
+        time_bits = []
+        start = item.get("event_at_start")
+        if isinstance(start, (int, float)):
+            basis = _one_line(item.get("time_basis"), 20)
+            time_bits.append(f"事件时间{_fmt_local(start)}" + (f"（原话“{basis}”）" if basis else ""))
+        not_before = item.get("not_before")
+        if isinstance(not_before, (int, float)) and now >= not_before:
+            time_bits.append("已到可以接续的时间")
+        if item.get("remind_requested"):
+            time_bits.append("对方要求过提醒")
+        last = item.get("last_mentioned_at")
+        if isinstance(last, (int, float)):
+            time_bits.append(f"上次提起于{_fmt_local(last)}")
+        if time_bits:
+            parts.append("时间:" + "，".join(time_bits))
+        lines.append("- " + " | ".join(parts))
+    if not lines:
+        return ""
+    return "<candidates>\n" + "\n".join(lines) + "\n</candidates>"
+
+
+def build_avoid_block(topics: list[str] | None) -> str:
+    """构建 <avoid_topics> 块（只列话题，不含次数/分数），无内容时返回空串。"""
+    lines = []
+    seen = set()
+    for t in topics or ():
+        s = _one_line(t, 40)
+        if s and s not in seen:
+            seen.add(s)
+            lines.append(f"- {s}")
+    if not lines:
+        return ""
+    return "<avoid_topics>\n" + "\n".join(lines) + "\n</avoid_topics>"
+
+
+def candidate_ids(candidates: list[dict[str, Any]] | None) -> set[str]:
+    return {
+        str(c.get("item_id")).strip()
+        for c in (candidates or [])
+        if str(c.get("item_id") or "").strip()
+    }
 
 
 @dataclass
@@ -239,19 +362,66 @@ class DecisionCore:
 
         user_prompt += build_anchor_block(self._state.get_anchor(req.group_id), req.motive)
 
+        private_initiate = req.motive == "initiate" and req.private
         instruction = MOTIVE_INSTRUCTIONS[req.motive]
-        if req.motive == "initiate":
+        free = private_initiate and bool(req.freedom_facts)
+        gfree = req.group_free and not req.private and req.motive in ("chime_in", "initiate")
+        if free:
+            instruction = private_free_instruction(req.chat_drive, req.self_pause_cap or None)
+            custom = self._config.proactive_instruction
+            if custom:
+                instruction += f"\n话题倾向：{custom}"
+        elif gfree:
+            if req.motive == "initiate":
+                instruction = GROUP_INITIATE_INSTRUCTION_FREE.format(quiet_minutes=max(0, req.quiet_minutes))
+                custom = self._config.proactive_instruction
+                if custom:
+                    instruction += f"\n话题倾向：{custom}"
+            elif req.trigger == "hostile":
+                instruction = GROUP_HOSTILE_INSTRUCTION.format(user_id=req.trigger_user or "?")
+            elif req.trigger in TRIGGER_INSTRUCTIONS and req.trigger != "owner":
+                instruction = TRIGGER_INSTRUCTIONS[req.trigger].format(user_id=req.trigger_user or "?")
+            else:
+                instruction = GROUP_CHIME_INSTRUCTION_FREE.format(cap=max(1, int(req.self_pause_cap or 15)))
+        elif private_initiate:
+            instruction = PRIVATE_INITIATE_INSTRUCTION.format(
+                quiet_minutes=max(0, req.quiet_minutes)
+            )
+            custom = self._config.proactive_instruction
+            if custom:
+                instruction += f"\n话题倾向：{custom}"
+        elif req.motive == "chime_in" and req.trigger in TRIGGER_INSTRUCTIONS:
+            instruction = TRIGGER_INSTRUCTIONS[req.trigger].format(
+                user_id=req.trigger_user or "?"
+            )
+        elif req.motive == "initiate":
             instruction = instruction.format(quiet_minutes=max(0, req.quiet_minutes))
             instruction += "\n" + prompts["initiate_style"]
             custom = self._config.proactive_instruction
             if custom:
                 instruction += f"\n话题倾向：{custom}"
         user_prompt += f"\n\n<instruction>{instruction}</instruction>"
+        if (free or gfree) and req.freedom_facts:
+            user_prompt += f"\n\n{req.freedom_facts}"
+
+        if req.motive == "initiate" and req.candidates:
+            block = build_candidates_block(req.candidates, req.now)
+            if block:
+                user_prompt += f"\n\n{block}\n{CANDIDATES_INSTRUCTION}"
+        if private_initiate and req.avoid_topics:
+            avoid_block = build_avoid_block(req.avoid_topics)
+            if avoid_block:
+                user_prompt += f"\n\n{avoid_block}\n{AVOID_TOPICS_INSTRUCTION}"
 
         messages = self._window.get_messages(req.group_id)
         user_prompt += "\n\n" + self._packager.package(req.group_id, messages, req.motive)
 
-        system_prompt = prompts["decision_system"]
+        if free:
+            system_prompt = private_free_system(req.chat_drive)
+        elif gfree:
+            system_prompt = group_free_system(req.chat_drive)
+        else:
+            system_prompt = PRIVATE_DECISION_SYSTEM if private_initiate else prompts["decision_system"]
         time_hint = wrap_system_reminder(
             self._time_hint_get(req.group_id) if self._time_hint_get else ""
         )
@@ -291,6 +461,13 @@ class DecisionCore:
                     "content": self._config.proactive_instruction,
                 }
             )
+
+        if req.motive == "initiate" and req.candidates:
+            sources.append(
+                {"source": "candidates", "values": sorted(candidate_ids(req.candidates))}
+            )
+        if req.motive == "initiate" and req.private and req.avoid_topics:
+            sources.append({"source": "avoid_topics", "values": list(req.avoid_topics)})
 
         messages = self._window.get_messages(req.group_id)
         total = len(messages)
@@ -373,8 +550,17 @@ class DecisionCore:
             )
             _record_decision_log(req, provider_id, outcome)
             return outcome
+        if req.speak_wins:
+            decision = parse_decision(raw, mode=req.motive, speak_wins=True)
+        else:
+            decision = parse_decision(raw, mode=req.motive)
+        if decision.item_id is not None and decision.item_id not in candidate_ids(
+            req.candidates
+        ):
+            # 不在候选集中的 id 一律视为 null（防止模型编造或越权引用事项）
+            decision.item_id = None
         outcome = DecisionOutcome(
-            decision=parse_decision(raw, mode=req.motive),
+            decision=decision,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             raw_text=raw,

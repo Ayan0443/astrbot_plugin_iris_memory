@@ -24,6 +24,7 @@ from ..platform.base import PRIVATE_SESSION_PREFIX
 from ..llm.policy import CallPriority
 from ..tasks.work_queue import BoundedWorkQueue
 from ..utils import count_tokens
+from ..utils.log_redact import text_for_log
 from .models import ContextMessage, SegmentedMessageQueue
 from .outbox import SummaryOutbox
 from .summarizer import Summarizer
@@ -1284,7 +1285,7 @@ class L1Buffer(Component):
                 is_low_quality, reason = self._is_low_quality_memory(content, user_id)
                 if is_low_quality:
                     quality_filtered += 1
-                    logger.info(f"过滤低质量记忆：{content[:50]}（原因：{reason}）")
+                    logger.info(f"过滤低质量记忆：{text_for_log(content, 50)}（原因：{reason}）")
                     continue
 
                 metadata = {

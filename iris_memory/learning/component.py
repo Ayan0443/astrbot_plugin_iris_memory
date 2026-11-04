@@ -626,8 +626,11 @@ class LearningComponent(Component):
             config = get_config()
             decay_days = config.get_int("learning.pattern_decay_days", 15) or 15
             max_count = config.get_int("learning.pattern_max_count", 300) or 300
+            rotation = config.get("learning_pattern_rotation", False) is True
             async with self._db_lock:
-                expression.decay(self._storage, decay_days, max_count)
+                expression.decay(
+                    self._storage, decay_days, max_count, rotation=rotation
+                )
         except Exception as e:
             logger.warning(f"表达模式衰减执行失败：{e}")
 

@@ -208,8 +208,11 @@ class TestSlimProfileDict:
         assert "custom_fields" not in slimmed
         assert slimmed["language_style"] == "简洁"
 
-    def test_preserves_numeric_zero(self):
-        """数值 0 不被过滤（favorability=0 是有效值）"""
+    def test_preserves_numeric_zero(self, monkeypatch):
+        """数值 0 不被过滤（favorability=0 是有效值）——P0-5 守卫关闭时的旧行为"""
+        from astrbot_plugin_iris_memory.iris_memory.lifelike.guards import numeric as ng
+
+        monkeypatch.setattr(ng, "guard_enabled", lambda: False)
         profile = {
             "user_id": "u1",
             "favorability": 0,
@@ -218,6 +221,15 @@ class TestSlimProfileDict:
         slimmed = _slim_profile_dict(profile)
         # 0 是有效数值，保留
         assert slimmed.get("favorability") == 0
+        assert slimmed["emotional_baseline"] == "稳定"
+
+    def test_strips_favorability_when_numeric_guard_on(self, monkeypatch):
+        """P0-5：守卫开启时好感度残留不进分析 prompt"""
+        from astrbot_plugin_iris_memory.iris_memory.lifelike.guards import numeric as ng
+
+        monkeypatch.setattr(ng, "guard_enabled", lambda: True)
+        slimmed = _slim_profile_dict({"favorability": 0, "emotional_baseline": "稳定"})
+        assert "favorability" not in slimmed
         assert slimmed["emotional_baseline"] == "稳定"
 
 

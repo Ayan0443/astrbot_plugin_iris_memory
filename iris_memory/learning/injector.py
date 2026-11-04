@@ -9,7 +9,10 @@ few-shot 对话样例，组装 `## 群聊用语与表达风格` 分小节文本�
 - 无内容返回 ""。
 """
 
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+import math
+import random
+from collections import OrderedDict, deque
+from typing import Any, Deque, Dict, List, Optional, Sequence, Set, Tuple, TYPE_CHECKING
 
 from ..config import get_config
 from ..core import get_logger
@@ -24,6 +27,154 @@ if TYPE_CHECKING:
 logger = get_logger("learning.injector")
 
 _SECTION_HEADER = "## 群聊用语与表达风格"
+
+# ---------------------------------------------------------------------------
+# P1-3 反自我强化（口吻附录 §5.5）：表达模式加权随机 + 冷却；few-shot 按场景过滤 + 冷却。
+# 冷却只在进程内存里（按 群/会话 + persona），重启清空；参数只在代码里。
+# ---------------------------------------------------------------------------
+_PATTERN_POOL_MIN = 60
+_PATTERN_POOL_MAX = 200
+_PATTERN_COOLDOWN_ROUNDS = 3
+_FEW_SHOT_POOL_MIN = 20
+_FEW_SHOT_COOLDOWN_ROUNDS = 2
+_TAIL_PARTICLE_QUOTA = 1  # 语气词结尾的模式每轮最多几条
+_ROTATION_MAX_KEYS = 256
+_TONE_TAILS = ("呀", "啊", "呢", "吧", "嘛", "哦", "哈", "啦", "哩")
+_EDGE_PUNCT = "。！？!?~～…．.，,、；; \t\r\n"
+
+_rng = random.Random()
+_pattern_rounds: "OrderedDict[Tuple[str, str], Deque[Set[int]]]" = OrderedDict()
+_few_shot_rounds: "OrderedDict[Tuple[str, str], Deque[Set[int]]]" = OrderedDict()
+
+
+def reset_rotation_state(seed: Optional[int] = None) -> None:
+    """清空冷却记录（测试 / 重载用）；可选重设随机种子。"""
+    _pattern_rounds.clear()
+    _few_shot_rounds.clear()
+    if seed is not None:
+        _rng.seed(seed)
+
+
+def _rounds_for(
+    store: "OrderedDict[Tuple[str, str], Deque[Set[int]]]", key: Tuple[str, str], maxlen: int
+) -> Deque[Set[int]]:
+    dq = store.get(key)
+    if dq is None:
+        dq = deque(maxlen=maxlen)
+        store[key] = dq
+        while len(store) > _ROTATION_MAX_KEYS:
+            store.popitem(last=False)
+    else:
+        store.move_to_end(key)
+    return dq
+
+
+def _cooled_ids(rounds: Deque[Set[int]], effective: int) -> Set[int]:
+    if effective <= 0:
+        return set()
+    out: Set[int] = set()
+    for ids in list(rounds)[-effective:]:
+        out |= ids
+    return out
+
+
+def _is_reaction_only(text: str) -> bool:
+    from .expression import _is_reaction_only as impl
+
+    return impl(text or "")
+
+
+def _ends_with_tone(text: str) -> bool:
+    core = (text or "").rstrip(_EDGE_PUNCT)
+    return bool(core) and core[-1] in _TONE_TAILS
+
+
+def _weighted_sample(items: Sequence[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
+    """不放回加权抽样（Efraimidis-Spirakis）；命中越多权重越低，抑制"越注入越靠前"。"""
+    keyed = []
+    for item in items:
+        hits = max(0, int(item.get("hit_count") or 0))
+        weight = 1.0 / (1.0 + math.log1p(hits))
+        u = _rng.random() or 1e-12
+        keyed.append((u ** (1.0 / weight), item))
+    keyed.sort(key=lambda kv: kv[0], reverse=True)
+    return [item for _key, item in keyed[:k]]
+
+
+def _rotate_patterns(
+    storage: LearningStorage, group_id: str, persona_id: str, top_n: int
+) -> List[Dict[str, Any]]:
+    pool_size = min(_PATTERN_POOL_MAX, max(top_n * 12, _PATTERN_POOL_MIN))
+    pool = [
+        p for p in storage.get_approved_patterns(group_id, pool_size, persona_id)
+        if not _is_reaction_only(str(p.get("expression") or ""))
+    ]
+    rounds = _rounds_for(_pattern_rounds, (group_id, persona_id), _PATTERN_COOLDOWN_ROUNDS)
+    # 池子太小时自动缩短冷却，保证每轮仍有 top_n 条可选
+    effective = min(_PATTERN_COOLDOWN_ROUNDS, max(0, len(pool) // max(1, top_n) - 1))
+    cooled = _cooled_ids(rounds, effective)
+    candidates = [p for p in pool if int(p["id"]) not in cooled]
+    picked: List[Dict[str, Any]] = []
+    tone_used = 0
+    for item in _weighted_sample(candidates, len(candidates)):
+        if len(picked) >= top_n:
+            break
+        if _ends_with_tone(str(item.get("expression") or "")):
+            if tone_used >= _TAIL_PARTICLE_QUOTA:
+                continue
+            tone_used += 1
+        picked.append(item)
+    rounds.append({int(p["id"]) for p in picked})
+    return picked
+
+
+def _rotate_few_shots(
+    storage: LearningStorage,
+    group_id: str,
+    persona_id: str,
+    few_shot_max: int,
+    user_text: str,
+    is_group: bool,
+) -> List[Dict[str, Any]]:
+    from ..lifelike.style.guard import CUTE
+    from ..style import register as R
+
+    pool = storage.get_approved_few_shots(
+        group_id, max(_FEW_SHOT_POOL_MIN, few_shot_max * 6), persona_id
+    )
+    current = R.judge_scene(user_text, is_group=is_group)
+    same: List[Dict[str, Any]] = []
+    other: List[Dict[str, Any]] = []
+    for fs in pool:
+        judged = R.judge_scene(str(fs.get("user_text") or ""), is_group=is_group)
+        if judged.register > current.register:
+            continue  # 淡档场景不注入浓档样例
+        if current.cute == R.CUTE_OFF and any(
+            pat.search(str(fs.get("bot_text") or "")) for _rid, pat in CUTE
+        ):
+            continue  # 不卖萌场景不注入卖萌样例
+        (same if judged.scene == current.scene else other).append(fs)
+    rounds = _rounds_for(_few_shot_rounds, (group_id, persona_id), _FEW_SHOT_COOLDOWN_ROUNDS)
+    total = len(same) + len(other)
+    effective = min(_FEW_SHOT_COOLDOWN_ROUNDS, max(0, total // max(1, few_shot_max) - 1))
+    cooled = _cooled_ids(rounds, effective)
+    same = [fs for fs in same if int(fs["id"]) not in cooled]
+    other = [fs for fs in other if int(fs["id"]) not in cooled]
+    _rng.shuffle(same)
+    _rng.shuffle(other)
+    picked = (same + other)[:few_shot_max]
+    rounds.append({int(fs["id"]) for fs in picked})
+    # 展示顺序保持"最新优先"
+    order = {int(fs["id"]): i for i, fs in enumerate(pool)}
+    picked.sort(key=lambda fs: order.get(int(fs["id"]), 0))
+    return picked
+
+
+def _flag(config: Any, key: str) -> bool:
+    try:
+        return config.get(key, False) is True
+    except Exception:
+        return False
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -62,17 +213,35 @@ async def build_learning_context(
     max_item_chars = config.get_int("learning_inject_max_item_chars", 200) or 200
     max_tokens = config.get_int("learning_inject_max_tokens", 600) or 600
 
-    # 1. 已通过的表达模式 top-N（按命中数），并记录命中
-    patterns = storage.get_approved_patterns(group_id, top_n, persona_id)
+    user_text = getattr(event, "message_str", "") or ""
+
+    # 1. 已通过的表达模式：P1-3 开启时加权随机 + 冷却，否则 top-N（按命中数）；都记录命中
+    if _flag(config, "learning_pattern_rotation"):
+        try:
+            patterns = _rotate_patterns(storage, group_id, persona_id, top_n)
+        except Exception as e:
+            logger.warning(f"[lifelike.learning_rotation] pattern fallback: {type(e).__name__}")
+            patterns = storage.get_approved_patterns(group_id, top_n, persona_id)
+    else:
+        patterns = storage.get_approved_patterns(group_id, top_n, persona_id)
     if patterns:
         storage.record_pattern_hit([int(p["id"]) for p in patterns])
 
     # 2. 用户消息命中的已推断暗语（最多 5 条）
-    user_text = getattr(event, "message_str", "") or ""
     jargon_hits = jargon.match_terms(group_id, user_text, max_items=5)
 
-    # 3. 已通过的 few-shot 对话样例（最近 N 条）
-    few_shots = storage.get_approved_few_shots(group_id, few_shot_max, persona_id)
+    # 3. 已通过的 few-shot 对话样例：P1-3 开启时按本轮场景过滤 + 冷却，否则最近 N 条
+    if _flag(config, "learning_few_shot_scene_filter"):
+        try:
+            is_group = bool(adapter.get_group_id(event))
+            few_shots = _rotate_few_shots(
+                storage, group_id, persona_id, few_shot_max, user_text, is_group
+            )
+        except Exception as e:
+            logger.warning(f"[lifelike.learning_rotation] few-shot fallback: {type(e).__name__}")
+            few_shots = storage.get_approved_few_shots(group_id, few_shot_max, persona_id)
+    else:
+        few_shots = storage.get_approved_few_shots(group_id, few_shot_max, persona_id)
 
     if not patterns and not jargon_hits and not few_shots:
         if meta is not None:

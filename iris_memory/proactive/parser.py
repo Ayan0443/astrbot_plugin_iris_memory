@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from astrbot.api import logger
+from ..utils.log_redact import text_for_log
 
 _INITIATE_TOPIC_SOURCES = {"recent_context", "time_context", "shared_interest"}
 
@@ -27,6 +28,7 @@ class Decision:
     drifted: bool = False
     cooldown_minutes: int = 0
     parse_failed: bool = False
+    item_id: str | None = None  # 主动发起围绕的连续性候选事项（由调用方按候选集校验）
 
     @property
     def should_speak(self) -> bool:
@@ -122,11 +124,16 @@ def _parse_cooldown(raw: Any) -> int:
     return min(minutes, 120)
 
 
-def parse_decision(text: str, mode: str = "") -> Decision:
-    """解析 LLM 统一决策输出，兼容多种字段命名。"""
+def parse_decision(text: str, mode: str = "", *, speak_wins: bool = False) -> Decision:
+    """解析 LLM 统一决策输出，兼容多种字段命名。
+
+    speak_wins=True（U8 / U9 打开且聊天欲望调整打开时）：她明确决定 speak 时，
+    同时给出的 drifted（旧话题结束）/ cooldown 不再把这次开口改成 none——drifted 仍原样返回
+    （调用方据此关闭旧锚点），cooldown 归零；主动开题 topic 为空时用 obs 补、仍为空则不说，缺 why_now / topic_source 时补默认依据。
+    默认 False = 原有解析。"""
     obj = extract_json(text)
     if not obj:
-        logger.warning("Iris Reply: decision JSON parse failed, raw text: %.300s", text)
+        logger.warning("Iris Reply: decision JSON parse failed, raw text: %s", text_for_log(text, 300))
         return Decision(mode=mode, parse_failed=True)
 
     action = _parse_action(obj.get("action"), obj.get("reply"))
@@ -143,6 +150,15 @@ def parse_decision(text: str, mode: str = "") -> Decision:
     why = str(obj.get("why", obj.get("interest_reason", "")))
     drifted = parse_bool(obj.get("drifted", obj.get("topic_drifted", False)))
     cooldown = _parse_cooldown(obj.get("cooldown", 0))
+    raw_item_id = obj.get("item_id")
+    if raw_item_id in (None, "") and isinstance(obj.get("candidate_id"), str):
+        # 活人感 P1-8：决策 JSON 的 candidate_id 与 item_id 等价（仍由调用方按候选集校验）
+        raw_item_id = obj.get("candidate_id")
+    item_id = (
+        str(raw_item_id).strip()
+        if isinstance(raw_item_id, (str, int)) and not isinstance(raw_item_id, bool)
+        else ""
+    )
 
     # 防御：不要求发言时忽略 message/topic；drifted 时不应发言
     if action != "speak":
@@ -150,14 +166,25 @@ def parse_decision(text: str, mode: str = "") -> Decision:
         topic = ""
         why_now = ""
         topic_source = ""
-    if drifted and action == "speak":
+    if speak_wins and action == "speak":
+        cooldown = 0
+    if drifted and action == "speak" and not speak_wins:
         action = "none"
         message = ""
         topic = ""
         why_now = ""
         topic_source = ""
     # 主动开题必须说明“为什么是现在”以及依据来源；缺少现场理由时宁可不说。
-    if mode == "initiate" and action == "speak" and not (
+    if speak_wins and mode == "initiate" and action == "speak":
+        # 审查 M8：仍要有切入角度——topic 为空用 obs 补，仍为空就不说；why_now / topic_source 缺了补默认依据
+        if not topic:
+            topic = observation.strip()[:60]
+        if not topic:
+            action = "none"
+            message = why_now = topic_source = ""
+        elif topic_source not in _INITIATE_TOPIC_SOURCES:
+            topic_source = "recent_context"
+    if not speak_wins and mode == "initiate" and action == "speak" and not (
         topic and why_now and topic_source in _INITIATE_TOPIC_SOURCES
     ):
         action = "none"
@@ -179,4 +206,5 @@ def parse_decision(text: str, mode: str = "") -> Decision:
         why=why,
         drifted=drifted,
         cooldown_minutes=cooldown,
+        item_id=(item_id or None) if action == "speak" else None,
     )

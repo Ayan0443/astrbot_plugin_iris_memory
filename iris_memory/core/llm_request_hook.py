@@ -285,14 +285,39 @@ async def preprocess_llm_request(
         )
 
     l3_task = asyncio.create_task(collect_l3_after_l2())
-    l1_text, profile_text, l2_pair, l3_text, learning_text = await asyncio.gather(
-        l1_task, profile_task, l2_task, l3_task, learning_task
+
+    # P1-2 口吻风格段：与 learning 并列，只读风格库文件和本轮消息，
+    # 不经过 LearningComponent.build_context（复审期间照常注入）、不拿 _db_lock。
+    # 开关关闭时不建任务、不写 meta，行为与改造前一致。
+    style_tasks = []
+    if _style_enabled():
+        inject_meta["style"] = {}
+        style_tasks.append(
+            asyncio.create_task(
+                _run_stage(
+                    "style",
+                    inject_meta["style"],
+                    _collect_style(event, user_message, meta=inject_meta["style"]),
+                    "",
+                )
+            )
+        )
+    (
+        l1_text,
+        profile_text,
+        l2_pair,
+        l3_text,
+        learning_text,
+        *style_results,
+    ) = await asyncio.gather(
+        l1_task, profile_task, l2_task, l3_task, learning_task, *style_tasks
     )
+    style_text = style_results[0] if style_results else ""
     l2_text, _l2_results = l2_pair
     total_duration_ms = _elapsed_ms(preprocess_started)
 
     combined = _inject_to_extra_user_content_parts(
-        req, l1_text, profile_text, l2_text, l3_text, learning_text
+        req, l1_text, profile_text, l2_text, l3_text, learning_text, style_text
     )
 
     _record_injection_log(
@@ -303,6 +328,7 @@ async def preprocess_llm_request(
         l2_text=l2_text,
         l3_text=l3_text,
         learning_text=learning_text,
+        style_text=style_text,
         meta=inject_meta,
         combined=combined,
         user_message=user_message,
@@ -462,6 +488,7 @@ def _record_injection_log(
     combined: str,
     user_message: str,
     total_duration_ms: float,
+    style_text: str = "",
 ) -> None:
     """写入统一运行日志（injection 类型），失败不影响主流程"""
     try:
@@ -485,6 +512,8 @@ def _record_injection_log(
             "l3_kg": {"chars": len(l3_text), "injected": bool(l3_text), **meta.get("l3", {})},
             "learning": {"chars": len(learning_text), "injected": bool(learning_text), **meta.get("learning", {})},
         }
+        if "style" in meta:
+            sections["style"] = {"chars": len(style_text), "injected": bool(style_text), **meta.get("style", {})}
         injected_count = sum(1 for s in sections.values() if s["injected"])
 
         image_meta = getattr(req, "_iris_image_meta", None)
@@ -510,6 +539,7 @@ def _record_injection_log(
             stage_timings_ms={
                 stage: round(float(meta.get(stage, {}).get("duration_ms", 0.0)), 2)
                 for stage in ("image", "l1", "profile", "l2", "l3", "learning")
+                + (("style",) if "style" in meta else ())
             },
             total_duration_ms=round(total_duration_ms, 2),
             content=combined,
@@ -525,6 +555,7 @@ def _inject_to_extra_user_content_parts(
     l2_text: str,
     l3_text: str,
     learning_text: str = "",
+    style_text: str = "",
 ) -> str:
     """将所有动态内容注入到 req.extra_user_content_parts
 
@@ -551,6 +582,27 @@ def _inject_to_extra_user_content_parts(
         ("l2_memory", l2_text),
         ("l3_kg", l3_text),
         ("learning", learning_text),
+    ]
+    # P1-2：<iris:style> 放在 learning 之后；为空时不加入列表（与改造前逐字节一致）
+    if style_text:
+        sections.append(("style", style_text))
+
+    # P0-5 NumericLeakGuard：数值化关系表达整行丢弃（开关关闭 / 异常时原样）。
+    # 画像是系统生成段，用 strict（"好感度"等字段名本身即视为残留）。
+    from ..lifelike.guards.numeric import guard_text as _numeric_guard
+
+    # 原始对话段（l1_context / learning）用 lenient：弱规则只观测不删行（审查 M3）。
+    sections = [
+        (
+            name,
+            _numeric_guard(
+                content,
+                source=name,
+                strict=name == "profile",
+                lenient=name in ("l1_context", "learning"),
+            ),
+        )
+        for name, content in sections
     ]
 
     parts = []
@@ -930,7 +982,11 @@ async def _collect_user_profile(
         user_id, effective_group_id, persona_id
     )
 
-    profile_text = _format_profiles_for_injection(group_profile, user_profile)
+    # 群聊只注入称呼级字段：私聊积累的重要事件/日期、禁忌、职业、情感等
+    # 不得随主人在群里发言被带进群聊请求
+    profile_text = _format_profiles_for_injection(
+        group_profile, user_profile, is_group=bool(group_id)
+    )
 
     if profile_text:
         logger.debug(f"已收集画像信息：群聊 {group_id} 用户 {user_id}")
@@ -1145,6 +1201,8 @@ async def _collect_l2_memory(
             group_id=group_id,
             persona_id=persona_id,
         )
+        if not group_id and l2_results:
+            l2_results = _private_l2_scrub(l2_results, config, meta)
 
         context_text = ""
         injected_count = 0
@@ -1177,6 +1235,59 @@ async def _collect_l2_memory(
         if meta is not None:
             meta["error"] = str(e)
         return "", []
+
+
+def _private_l2_scrub(results: list, config, meta: Optional[dict]) -> list:
+    """活人感 R1：私聊注入的 L2 只取私聊来源 / 授权群 / global，且群来源过敏感过滤。
+
+    ``lifelike_private_l2_filter=false`` 或异常 → 原样返回（旧行为）。日志只记条数。
+    """
+    try:
+        from ..lifelike.social import l2_filter
+
+        if not l2_filter.private_filter_enabled(config):
+            return results
+        groups = l2_filter.allowed_groups_from_config(config)
+        kept, stats = l2_filter.filter_private_l2(results, groups)
+        dropped = len(results) - len(kept)
+        if dropped:
+            logger.info(
+                f"[lifelike.private_l2] dropped={dropped} unauthorized={stats['unauthorized']}"
+                f" sensitive={stats['sensitive']} kept={stats['kept']}"
+            )
+        if meta is not None and dropped:
+            meta["private_filtered"] = dropped
+        return kept
+    except Exception as e:
+        logger.warning(f"[lifelike.private_l2] filter failed: {type(e).__name__}")
+        return results
+
+
+def _private_graph_scrub(nodes: list, edges: list, config, meta: Optional[dict]) -> tuple:
+    """活人感 R1（L3 延伸）：私聊注入的图谱节点只取私聊来源 / 授权群来源。
+
+    开关同 ``lifelike_private_l2_filter``；关闭 → 原样返回。异常 → 返回空（宁可不注入，
+    隐私优先；L3 是补充上下文）。日志只记条数。
+    """
+    try:
+        from ..lifelike.social import l2_filter
+
+        if not l2_filter.private_filter_enabled(config):
+            return nodes, edges
+        groups = l2_filter.allowed_groups_from_config(config)
+        kept, kept_edges, stats = l2_filter.filter_private_graph(nodes, edges, groups)
+        dropped = len(nodes) - len(kept)
+        if dropped:
+            logger.info(
+                f"[lifelike.private_l2] l3 dropped={dropped} unauthorized={stats['unauthorized']}"
+                f" sensitive={stats['sensitive']} kept={stats['kept']}"
+            )
+            if meta is not None:
+                meta["private_filtered"] = dropped
+        return kept, kept_edges
+    except Exception as e:
+        logger.warning(f"[lifelike.private_l2] l3 filter failed: {type(e).__name__}")
+        return [], []
 
 
 async def _collect_l3_knowledge_graph(
@@ -1235,6 +1346,7 @@ async def _collect_l3_knowledge_graph(
 
     adapter = get_adapter(event)
     group_id = adapter.get_group_id(event)
+    is_private = not group_id
     from ..core.persona import resolve_persona
 
     persona_id = await resolve_persona(component_manager, event)
@@ -1317,6 +1429,16 @@ async def _collect_l3_knowledge_graph(
                 strategy = "keywords"
                 logger.debug(f"基于关键词检索：{len(nodes)} 节点，{len(edges)} 边")
 
+        if is_private and all_nodes:
+            kept_nodes, kept_edges = _private_graph_scrub(
+                list(all_nodes.values()), list(all_edges.values()), config, meta
+            )
+            all_nodes = {str(n.get("id")): n for n in kept_nodes if n.get("id")}
+            all_edges = {
+                f"{e.get('source', '')}-{e.get('relation_type', '')}-{e.get('target', '')}": e
+                for e in kept_edges
+            }
+
         if not all_nodes:
             if meta is not None:
                 meta["strategy"] = strategy
@@ -1356,6 +1478,38 @@ async def _collect_l3_knowledge_graph(
         return ""
 
 
+def _style_enabled() -> bool:
+    """P1-2 开关（style_anime_register != off）；异常视为关闭。"""
+    try:
+        from ..style.selector import style_enabled
+
+        return style_enabled()
+    except Exception as e:
+        logger.warning(f"[lifelike.style_inject] switch read failed: {type(e).__name__}")
+        return False
+
+
+async def _collect_style(
+    event: "AstrMessageEvent",
+    user_message: str,
+    meta: Optional[dict] = None,
+) -> str:
+    """收集 <iris:style> 段文本（P1-2）：场景档位判定 + 示例冷却轮换 + 卖萌上限。
+
+    纯内存 + 只读示例库文件，不碰 learning.db；任何异常返回 ""（= 不注入）。
+    """
+    from ..style.selector import get_selector, is_group_event, scope_key
+
+    scope = scope_key(event)
+    if not scope:
+        if meta is not None:
+            meta["skipped"] = "no_scope"
+        return ""
+    return get_selector().build_passive(
+        scope, user_message or "", is_group=is_group_event(event), meta=meta
+    )
+
+
 async def _collect_learning(
     event: "AstrMessageEvent",
     req: "ProviderRequest",
@@ -1384,6 +1538,13 @@ async def _collect_learning(
         logger.debug("学习模块未启用，跳过学习上下文注入")
         if meta is not None:
             meta["skipped"] = "disabled"
+        return ""
+
+    # P1-3：只暂停 learning 注入（采集与审查照常），供漂移告警 / 人工处置使用
+    if config.get("learning_inject_paused", False) is True:
+        logger.debug("learning 注入已暂停（learning_inject_paused=true）")
+        if meta is not None:
+            meta["skipped"] = "paused"
         return ""
 
     # 组件仅在 learning.enable=true 时注册，上面的配置检查已覆盖未启用场景，
@@ -1457,8 +1618,21 @@ def _extract_kg_keywords(text: str) -> List[str]:
     return unique[:8]
 
 
+def _format_important_date(entry: object) -> str:
+    """important_dates 条目兼容 dict({date, description}) 与历史遗留的 str。"""
+    if isinstance(entry, dict):
+        date = str(entry.get("date") or "").strip()
+        desc = str(entry.get("description") or "").strip()
+        if date and desc:
+            return f"{date}({desc})"
+        return date or desc
+    return str(entry or "").strip()
+
+
 def _format_profiles_for_injection(
-    group_profile: "GroupProfile", user_profile: "UserProfile"
+    group_profile: "GroupProfile",
+    user_profile: "UserProfile",
+    is_group: bool = False,
 ) -> str:
     """格式化画像为注入文本
 
@@ -1467,16 +1641,12 @@ def _format_profiles_for_injection(
     Args:
         group_profile: 群聊画像对象
         user_profile: 用户画像对象
+        is_group: 群聊请求时只保留称呼级字段（ID/昵称/曾用昵称/称呼），
+            不注入性格、兴趣、职业、情感、好感度、重要日期/事件、禁忌、自定义字段
 
     Returns:
         格式化的画像文本，任一部分为空则不注入该部分
     """
-    from ..config import get_config
-    from ..profile.models import favorability_level
-
-    config = get_config()
-    favorability_enabled = config.get("profile.favorability_enable", True)
-
     sections = []
 
     user_parts = [f"【发送者】ID: {user_profile.user_id}"]
@@ -1484,37 +1654,52 @@ def _format_profiles_for_injection(
         user_parts.append(f"昵称: {user_profile.user_name}")
     if user_profile.historical_names:
         user_parts.append(f"曾用昵称: {', '.join(user_profile.historical_names)}")
-    if user_profile.personality_tags:
-        user_parts.append(f"性格: {', '.join(user_profile.personality_tags)}")
-    if user_profile.interests:
-        user_parts.append(f"兴趣: {', '.join(user_profile.interests)}")
-    if user_profile.occupation:
-        user_parts.append(f"职业: {user_profile.occupation}")
-    if user_profile.language_style:
-        user_parts.append(f"语言风格: {user_profile.language_style}")
-    if user_profile.communication_style:
-        user_parts.append(f"沟通偏好: {user_profile.communication_style}")
-    if user_profile.emotional_baseline:
-        user_parts.append(f"情感: {user_profile.emotional_baseline}")
-    if favorability_enabled and user_profile.favorability > 0:
-        level = favorability_level(user_profile.favorability)
-        user_parts.append(f"好感度: {int(user_profile.favorability)}({level})")
-    if user_profile.bot_relationship:
-        user_parts.append(f"称呼: {user_profile.bot_relationship}")
-    if user_profile.important_dates:
-        dates_str = ", ".join(
-            f"{d['date']}({d['description']})" for d in user_profile.important_dates
-        )
-        user_parts.append(f"重要日期: {dates_str}")
-    if user_profile.important_events:
-        user_parts.append(f"重要事件: {', '.join(user_profile.important_events)}")
-    if user_profile.taboo_topics:
-        user_parts.append(f"禁忌: {', '.join(user_profile.taboo_topics)}")
-    if user_profile.custom_fields:
-        custom_str = ", ".join(
-            f"{k}: {v}" for k, v in user_profile.custom_fields.items()
-        )
-        user_parts.append(custom_str)
+    if is_group:
+        rel = (user_profile.bot_relationship or "").strip()
+        # 群里只放简短称呼；描述性的关系文字（可能涉及私下相处）不进群。
+        if rel and len(rel) <= 12 and not any(ch in rel for ch in "，。,.；;！!？?"):
+            user_parts.append(f"称呼: {rel}")
+    else:
+        if user_profile.personality_tags:
+            user_parts.append(f"性格: {', '.join(user_profile.personality_tags)}")
+        if user_profile.interests:
+            user_parts.append(f"兴趣: {', '.join(user_profile.interests)}")
+        if user_profile.occupation:
+            user_parts.append(f"职业: {user_profile.occupation}")
+        if user_profile.language_style:
+            user_parts.append(f"语言风格: {user_profile.language_style}")
+        if user_profile.communication_style:
+            user_parts.append(f"沟通偏好: {user_profile.communication_style}")
+        if user_profile.emotional_baseline:
+            # P0-5：情感基线是 LLM 对用户情绪的推测；守卫开启时按
+            # lifelike_emotion_hint 不注入或带"可能"措辞注入，关闭时与旧格式一致。
+            from ..lifelike.guards.numeric import emotion_hint
+
+            hint = emotion_hint(user_profile.emotional_baseline)
+            if hint is not None:
+                user_parts.append(f"情感{hint[0]}: {hint[1]}")
+        # 好感度（数值/等级）永不注入 prompt（DESIGN §12：prompt 中不出现数值评分），
+        # 与 profile.favorability_enable 无关；画像内部照常记录。
+        if user_profile.bot_relationship:
+            user_parts.append(f"称呼: {user_profile.bot_relationship}")
+        if user_profile.important_dates:
+            dates = [_format_important_date(d) for d in user_profile.important_dates]
+            dates_str = ", ".join(d for d in dates if d)
+            if dates_str:
+                user_parts.append(f"重要日期: {dates_str}")
+        if user_profile.important_events:
+            user_parts.append(
+                f"重要事件: {', '.join(str(e) for e in user_profile.important_events)}"
+            )
+        if user_profile.taboo_topics:
+            user_parts.append(
+                f"禁忌: {', '.join(str(t) for t in user_profile.taboo_topics)}"
+            )
+        if user_profile.custom_fields:
+            custom_str = ", ".join(
+                f"{k}: {v}" for k, v in user_profile.custom_fields.items()
+            )
+            user_parts.append(custom_str)
 
     if len(user_parts) > 1:
         sections.append("\n".join(user_parts))

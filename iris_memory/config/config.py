@@ -20,6 +20,9 @@ from ..core import get_logger
 
 from .defaults import Defaults
 from .hidden_config import HiddenConfigManager
+from ..lifelike.master import GATED_OFF as _LIFELIKE_GATED
+from ..lifelike.master import KEY_ENABLE as _LIFELIKE_ENABLE
+from ..lifelike.master import gate as _lifelike_gate
 
 _UNSET = object()
 
@@ -126,6 +129,18 @@ class Config:
             >>> config.get("not_exist", "default")   # 不存在的配置
             "default"
         """
+        parts = flat_key.split(".")
+
+        if len(parts) == 1 and flat_key in _LIFELIKE_GATED:
+            # 活人感 P1/P2 总开关（ROADMAP §2.1）：lifelike_enable=false → 子模块开关取关闭值
+            return _lifelike_gate(
+                flat_key,
+                self._get_raw(flat_key, default),
+                lambda: self._get_raw(_LIFELIKE_ENABLE, None),
+            )
+        return self._get_raw(flat_key, default)
+
+    def _get_raw(self, flat_key: str, default: object = None) -> object:
         parts = flat_key.split(".")
 
         if len(parts) >= 2:

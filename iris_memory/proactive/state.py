@@ -65,6 +65,25 @@ class ThreadAnchor:
         self.created_at = 0.0
 
 
+def _as_float(value: Any) -> float:
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_recent(value: Any) -> list:
+    out: list = []
+    if not isinstance(value, list):
+        return out
+    for item in value[-30:]:
+        try:
+            out.append((float(item[0]), str(item[1] or "")[:120], str(item[2] or "")[:200]))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
 @dataclass
 class GroupStateData:
     state: GroupState = GroupState.IDLE
@@ -96,6 +115,10 @@ class GroupStateData:
     initiate_score: float = 0.0
     initiate_target: float = 0.0
     initiate_score_at: float = 0.0
+    # 活人感 U8：主人说"别发了 / 安静点"后的主动暂停截止时间（仅自由主动开关打开时读写）
+    proactive_hush_until: float = 0.0
+    # 活人感 U8：近 24h 自由主动出站 [(ts, topic, 规范化文本)]，只用于同内容 / 同话题去重
+    freedom_recent: list = field(default_factory=list)
     dirty: bool = False
 
 
@@ -123,6 +146,10 @@ class StateManager:
         self._whitelist: set[str] = set()
         self._whitelist_dirty: bool = False
         self._group_ids_dirty: bool = False
+        # 私聊 scope（private:）的无人接话 streak 是否允许满 24h 自动清零。
+        # 接入连续性桥接时由 ProactiveEngine 置 False：私聊暂停只能由本人新私聊消息
+        # （resume_after_owner_message）或管理员显式重置解除；群聊保持原有滚动恢复。
+        self.time_reset_private: bool = True
 
     def get_lock(self, group_id: str) -> asyncio.Lock:
         return self._locks.setdefault(group_id, asyncio.Lock())
@@ -164,8 +191,11 @@ class StateManager:
             data.initiate_daily_count = rolling_count
             self._mark_dirty(group_id, data)
         # 无人接话改为滚动退避：满 24h 后自动恢复，而不是依赖零点清零。
+        # 私聊在 time_reset_private=False 时不按时间恢复（见 __init__）。
+        time_reset = self.time_reset_private or not str(group_id).startswith("private:")
         if (
-            data.initiate_no_reply_streak > 0
+            time_reset
+            and data.initiate_no_reply_streak > 0
             and data.last_initiate_time > 0
             and now - data.last_initiate_time >= self.INITIATE_ROLLING_WINDOW
         ):
@@ -403,8 +433,13 @@ class StateManager:
         users: list[str] | None = None,
         keywords: list[str] | None = None,
         reason: str = "",
+        set_pending: bool = True,
     ) -> None:
-        """主动发起成功后记账：次数、时间、接话 pending，并写入发起锚点。"""
+        """主动发起成功后记账：次数、时间、接话 pending，并写入发起锚点。
+
+        set_pending=False：本人在首段发出后已回复（回合因新消息中止），只计额度与锚点，
+        不再设 pending（否则已被回复的回合会在超时后被误计为未回复）。
+        """
         data = self.get_state(group_id)  # get_state 处理跨天重置
         now = time.time()
         data.initiate_timestamps.append(now)
@@ -414,7 +449,8 @@ class StateManager:
         ]
         data.initiate_daily_count = len(data.initiate_timestamps)
         data.last_initiate_time = now
-        data.initiate_pending_since = now
+        if set_pending:
+            data.initiate_pending_since = now
         self.reset_initiate_drive(group_id, now=now)
         self.write_anchor(
             group_id,
@@ -427,10 +463,86 @@ class StateManager:
         )
         self._mark_dirty(group_id, data)
 
-    def record_initiate_unanswered(self, group_id: str) -> None:
-        """发起后超时无人接话：清除 pending 并累计 streak。"""
+    def reserve_initiate(self, group_id: str, *, now: float | None = None) -> float:
+        """发送结果不确定（uncertain）时预占额度：计入滚动额度与 last_initiate_time，
+        但不设 pending（不确定对方是否收到，不计未回复）。返回预占时间戳。"""
         data = self.get_state(group_id)
-        if data.initiate_pending_since <= 0:
+        now = time.time() if now is None else float(now)
+        data.initiate_timestamps.append(now)
+        data.initiate_timestamps = [
+            ts for ts in data.initiate_timestamps
+            if ts >= now - self.INITIATE_ROLLING_WINDOW
+        ]
+        data.initiate_daily_count = len(data.initiate_timestamps)
+        data.last_initiate_time = max(data.last_initiate_time, now)
+        self.reset_initiate_drive(group_id, now=now)
+        self._mark_dirty(group_id, data)
+        return now
+
+    def release_initiate_reservation(self, group_id: str, ts: float) -> bool:
+        """对账确认未发送：撤销 reserve_initiate 预占的那一次额度。"""
+        data = self.get_state(group_id)
+        ts = float(ts)
+        idx = next(
+            (i for i, v in enumerate(data.initiate_timestamps) if abs(v - ts) < 1e-3),
+            None,
+        )
+        if idx is None:
+            return False
+        data.initiate_timestamps.pop(idx)
+        data.initiate_daily_count = len(data.initiate_timestamps)
+        if abs(data.last_initiate_time - ts) < 1e-3:
+            data.last_initiate_time = max(data.initiate_timestamps, default=0.0)
+        self._mark_dirty(group_id, data)
+        return True
+
+    def set_proactive_hush(self, group_id: str, until: float) -> None:
+        """活人感 U8：主人叫停主动（until=0 解除）。"""
+        data = self._ensure_group(group_id)
+        data.proactive_hush_until = max(0.0, float(until))
+        self._mark_dirty(group_id, data)
+
+    def get_proactive_hush(self, group_id: str) -> float:
+        return float(self._ensure_group(group_id).proactive_hush_until or 0.0)
+
+    def note_freedom_sent(self, group_id: str, *, ts: float, topic: str, norm_text: str) -> None:
+        """活人感 U8：记一次自由主动出站（去重用；只保留近 24h、最多 30 条）。"""
+        data = self._ensure_group(group_id)
+        ts = float(ts)
+        kept = [x for x in data.freedom_recent if ts - float(x[0]) <= self.INITIATE_ROLLING_WINDOW]
+        kept.append((ts, str(topic or "")[:120], str(norm_text or "")[:200]))
+        data.freedom_recent = kept[-30:]
+        self._mark_dirty(group_id, data)
+
+    def get_freedom_recent(self, group_id: str) -> list:
+        return list(self._ensure_group(group_id).freedom_recent)
+
+    def resume_after_owner_message(self, group_id: str) -> bool:
+        """本人新私聊消息（水位推进）后恢复主动：清 streak 与 pending。"""
+        data = self._ensure_group(group_id)
+        changed = (
+            data.initiate_no_reply_streak != 0 or data.initiate_pending_since > 0
+        )
+        data.initiate_no_reply_streak = 0
+        data.initiate_pending_since = 0.0
+        self._mark_dirty(group_id, data)
+        return changed
+
+    def mark_initiate_pending(self, group_id: str, since: float) -> None:
+        """对账确认已送达的回合：从实际发送时间起等待接话（不重复计额度）。"""
+        data = self.get_state(group_id)
+        since = float(since)
+        if since > data.initiate_pending_since:
+            data.initiate_pending_since = since
+            self._mark_dirty(group_id, data)
+
+    def record_initiate_unanswered(self, group_id: str, *, force: bool = False) -> None:
+        """发起后超时无人接话：清除 pending 并累计 streak。
+
+        force=True：对账确认的回合等待期已过且无人回复（从未设过 pending），直接计一次。
+        """
+        data = self.get_state(group_id)
+        if data.initiate_pending_since <= 0 and not force:
             return
         data.initiate_pending_since = 0.0
         data.initiate_no_reply_streak += 1
@@ -844,7 +956,9 @@ class StateManager:
             "initiate_score": data.initiate_score,
             "initiate_target": data.initiate_target,
             "initiate_score_at": data.initiate_score_at,
-        }
+        } | ({"proactive_hush_until": data.proactive_hush_until} if data.proactive_hush_until > 0 else {}) | (
+            {"freedom_recent": [list(x) for x in data.freedom_recent]} if data.freedom_recent else {}
+        )
 
     def _deserialize_group(self, d: dict[str, Any]) -> GroupStateData:
         a = d.get("anchor", {})
@@ -917,6 +1031,8 @@ class StateManager:
             initiate_score=d.get("initiate_score", 0.0),
             initiate_target=d.get("initiate_target", 0.0),
             initiate_score_at=d.get("initiate_score_at", 0.0),
+            proactive_hush_until=_as_float(d.get("proactive_hush_until", 0.0)),
+            freedom_recent=_as_recent(d.get("freedom_recent")),
         )
 
     def get_status_text(self, group_id: str) -> str:
@@ -962,4 +1078,7 @@ class StateManager:
             lines.append(f"  发起接话等待中: {waiting:.1f} 分钟")
         if data.initiate_no_reply_streak > 0:
             lines.append(f"  无人接话 streak: {data.initiate_no_reply_streak}")
+        hush_left = float(data.proactive_hush_until or 0.0) - time.time()
+        if hush_left > 0:
+            lines.append(f"  主人叫停主动剩余: {hush_left / 3600:.1f} 小时")
         return "\n".join(lines)

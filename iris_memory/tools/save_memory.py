@@ -12,6 +12,29 @@ from ..l2_memory.adapter import L2MemoryAdapter
 logger = get_logger("tools")
 
 
+def _is_private_event(event, group_id) -> bool:
+    """私聊事件：没有群 ID，或平台明确报告为私聊。"""
+    if not group_id:
+        return True
+    try:
+        return event.is_private_chat() is True
+    except Exception:
+        return False
+
+
+def _group_global_guard_enabled() -> bool:
+    """``lifelike_group_global_memory_guard``（默认 true）：false=恢复旧行为（管理员群内可写 global）"""
+    try:
+        from ..config import get_config
+
+        v = get_config().get("lifelike_group_global_memory_guard", True)
+    except Exception:
+        return True
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "off", "no")
+    return True if v is None else bool(v)
+
+
 @dataclass
 class SaveMemoryTool(FunctionTool[AstrAgentContext]):
     """保存记忆到L2记忆库的Tool
@@ -136,6 +159,25 @@ class SaveMemoryTool(FunctionTool[AstrAgentContext]):
                         "拒绝未授权的全局记忆写入，已降级为群作用域: "
                         f"user={user_id}, group={group_id}"
                     )
+                elif _group_global_guard_enabled() and not _is_private_event(event, group_id):
+                    # 活人感 R2 / D16：群事件里不接受 LLM 自选 global（global 在所有群检索时
+                    # 豁免隔离，会把 A 群群友的事带到 B 群）；全局作用域只认主人显式操作
+                    # （WebUI 记忆管理里设置作用域）。
+                    scope = "group"
+                    scope_downgraded = True
+                    logger.info(
+                        f"[lifelike.memory_scope] group global downgraded group={group_id}"
+                    )
+                elif _is_private_event(event, group_id):
+                    # 私聊里的事保持私聊：global 会被群检索豁免隔离召回，
+                    # 即使是管理员本人的私聊也不允许写成全局记忆。
+                    scope = "group"
+                    scope_downgraded = True
+                    group_id = ""
+                    logger.warning(
+                        "私聊中请求的全局记忆已降级为私聊作用域: "
+                        f"user={user_id}"
+                    )
 
             # 始终保留真实 group_id：检索侧根据 enable_group_memory_isolation
             # 决定是否过滤，写入侧无需剥离，以便用户后续开启隔离时历史记忆可按群过滤
@@ -202,11 +244,12 @@ class SaveMemoryTool(FunctionTool[AstrAgentContext]):
             )
 
             ttl_line = f"\n过期时间: {expires_at}" if expires_at else ""
-            scope_line = (
-                "\n作用域: group（未授权创建全局记忆，已自动降级）"
-                if scope_downgraded
-                else f"\n作用域: {scope}"
-            )
+            if scope_downgraded and not group_id:
+                scope_line = "\n作用域: private（私聊中的记忆只在私聊可用，已自动降级）"
+            elif scope_downgraded:
+                scope_line = "\n作用域: group（未授权创建全局记忆，已自动降级）"
+            else:
+                scope_line = f"\n作用域: {scope}"
             return (
                 f"✓ 已保存记忆到长期记忆库\n"
                 f"ID: {memory_id}\n"

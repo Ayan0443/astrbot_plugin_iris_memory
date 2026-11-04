@@ -12,6 +12,7 @@ from ..core import get_logger
 from ..llm_modules import PROFILE_ANALYSIS
 from ..config import get_config
 from .models import UpdateTier
+from ..utils.log_redact import text_for_log
 
 if TYPE_CHECKING:
     from ..llm import LLMManager
@@ -21,13 +22,32 @@ logger = get_logger("profile")
 
 # LLM 分析时从画像字典中剥离的纯元数据字段（对分析无价值，徒增 token）
 _ANALYSIS_STRIP_KEYS = frozenset({"field_meta", "update_tracker", "version"})
+# 好感度残留字段（P0-5 隔离）
+_FAVORABILITY_KEYS = frozenset({"favorability", "favorability_delta"})
+
+
+def _numeric_guard_on() -> bool:
+    """P0-5 lifelike_numeric_guard；读取失败按默认 true。"""
+    try:
+        from ..lifelike.guards.numeric import guard_enabled
+
+        return guard_enabled()
+    except Exception:
+        return True
 
 
 def _slim_profile_dict(profile: Dict) -> Dict:
-    """剥离 LLM 分析无用的元数据字段并过滤空值，减少 prompt token。"""
+    """剥离 LLM 分析无用的元数据字段并过滤空值，减少 prompt token。
+
+    P0-5：守卫开启时同时剥离好感度残留数值（``favorability``），
+    避免旧值经分析 prompt 被改写进其他文字字段。
+    """
+    strip_fav = _numeric_guard_on()
     slimmed: Dict = {}
     for k, v in profile.items():
         if k in _ANALYSIS_STRIP_KEYS:
+            continue
+        if strip_fav and k in _FAVORABILITY_KEYS:
             continue
         if v in (None, "", [], {}):
             continue
@@ -185,6 +205,10 @@ class ProfileAnalyzer:
                 }
             )
 
+        # P0-5：好感度已关闭且守卫开启时，批量 schema 不再索要 favorability_delta
+        keep_fav = self._favorability_enabled() or not _numeric_guard_on()
+        fav_field = ' "favorability_delta": 0,' if keep_fav else ""
+
         prompt = f"""批量分析群聊与用户画像。输入中的 id 是唯一合法主体，严禁新增、改写或猜测 id。
 tier=mid 只更新中期字段，tier=long 只更新长期字段，tier=combined 可同时更新。
 
@@ -197,7 +221,7 @@ tier=mid 只更新中期字段，tier=long 只更新长期字段，tier=combined
   "users": {{
     "原样用户ID": {{
       "personality_tags": [], "interests": [], "occupation": "", "language_style": "",
-      "communication_style": "", "emotional_baseline": "", "favorability_delta": 0,
+      "communication_style": "", "emotional_baseline": "",{fav_field}
       "bot_relationship": "", "important_dates": [], "taboo_topics": [],
       "important_events": [], "custom_fields": {{}}
     }}
@@ -601,5 +625,5 @@ tier=mid 只更新中期字段，tier=long 只更新长期字段，tier=combined
                 except json.JSONDecodeError:
                     pass
 
-            logger.warning(f"无法解析JSON响应: {response[:100]}")
+            logger.warning(f"无法解析JSON响应: {text_for_log(response, 100)}")
             return {}

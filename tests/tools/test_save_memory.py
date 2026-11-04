@@ -238,7 +238,7 @@ async def test_save_memory_invalid_ttl_ignored(tool, mock_context, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_save_memory_scope_global(tool, mock_context, monkeypatch):
-    """scope=global 时元数据带全局标记"""
+    """scope=global 时元数据带全局标记（R2 守卫关闭 = 旧行为）"""
     mock_adapter = Mock()
     mock_adapter.get_user_id = Mock(return_value="user_123")
     mock_adapter.get_group_id = Mock(return_value="group_456")
@@ -246,7 +246,9 @@ async def test_save_memory_scope_global(tool, mock_context, monkeypatch):
     mock_context.context.event.is_admin = Mock(return_value=True)
 
     mock_config = Mock()
-    mock_config.get = Mock(return_value=True)
+    mock_config.get = Mock(
+        side_effect=lambda k, d=None: False if k == "lifelike_group_global_memory_guard" else True
+    )
 
     mock_l2 = Mock()
     mock_l2.is_available = True
@@ -286,6 +288,42 @@ async def test_save_memory_scope_global(tool, mock_context, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("guard_value", [True, None, "on"])
+async def test_save_memory_group_global_guard(tool, mock_context, monkeypatch, guard_value):
+    """活人感 R2 / D16：群事件里管理员的 LLM 自选 global 也降级为 group（默认开启）"""
+    mock_adapter = Mock()
+    mock_adapter.get_user_id = Mock(return_value="user_123")
+    mock_adapter.get_group_id = Mock(return_value="group_456")
+    mock_adapter.get_user_name = Mock(return_value="测试用户")
+    mock_context.context.event.is_admin = Mock(return_value=True)
+    mock_context.context.event.is_private_chat = Mock(return_value=False)
+
+    mock_config = Mock()
+    mock_config.get = Mock(
+        side_effect=lambda k, d=None: guard_value if k == "lifelike_group_global_memory_guard" else True
+    )
+    mock_l2 = Mock()
+    mock_l2.is_available = True
+    mock_l2.add_memory = AsyncMock(return_value="mem_scope2")
+    mock_manager = Mock()
+    mock_manager.get_component = Mock(return_value=mock_l2)
+    monkeypatch.setattr(
+        "astrbot_plugin_iris_memory.iris_memory.platform.get_adapter", Mock(return_value=mock_adapter)
+    )
+    monkeypatch.setattr("astrbot_plugin_iris_memory.iris_memory.config.get_config", Mock(return_value=mock_config))
+    monkeypatch.setattr(
+        "astrbot_plugin_iris_memory.iris_memory.tools.save_memory.get_component_manager",
+        Mock(return_value=mock_manager),
+    )
+
+    result = await tool.call(mock_context, content="群友的事", confidence=0.9, scope="global")
+    metadata = mock_l2.add_memory.call_args[0][1]
+    assert "scope" not in metadata
+    assert metadata["group_id"] == "group_456"
+    assert "自动降级" in result
+
+
+@pytest.mark.asyncio
 async def test_save_memory_empty_content(tool, mock_context):
     result = await tool.call(mock_context, content="")
     assert "不能为空" in result
@@ -318,3 +356,39 @@ async def test_save_memory_l2_unavailable(tool, mock_context, monkeypatch):
 
     result = await tool.call(mock_context, content="测试内容")
     assert "不可用" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group_id,private_flag", [("", True), (None, True), ("", False)])
+async def test_save_memory_global_from_private_chat_is_downgraded(
+    tool, mock_context, monkeypatch, group_id, private_flag
+):
+    """管理员私聊里请求 scope=global：降级为私聊作用域，group_id 为空且无全局标记。"""
+    mock_adapter = Mock()
+    mock_adapter.get_user_id = Mock(return_value="100000001")
+    mock_adapter.get_group_id = Mock(return_value=group_id)
+    mock_adapter.get_user_name = Mock(return_value="主人")
+    mock_context.context.event.is_admin = Mock(return_value=True)
+    mock_context.context.event.is_private_chat = Mock(return_value=private_flag)
+
+    mock_l2 = Mock()
+    mock_l2.is_available = True
+    mock_l2.add_memory = AsyncMock(return_value="mem_private")
+    mock_manager = Mock()
+    mock_manager.get_component = Mock(return_value=mock_l2)
+    mock_config = Mock()
+    mock_config.get = Mock(return_value=True)
+    monkeypatch.setattr(
+        "astrbot_plugin_iris_memory.iris_memory.platform.get_adapter", Mock(return_value=mock_adapter)
+    )
+    monkeypatch.setattr("astrbot_plugin_iris_memory.iris_memory.config.get_config", Mock(return_value=mock_config))
+    monkeypatch.setattr(
+        "astrbot_plugin_iris_memory.iris_memory.tools.save_memory.get_component_manager",
+        Mock(return_value=mock_manager),
+    )
+
+    result = await tool.call(mock_context, content="私聊里的私事", confidence=0.9, scope="global")
+    metadata = mock_l2.add_memory.call_args[0][1]
+    assert "scope" not in metadata
+    assert metadata["group_id"] == ""
+    assert "私聊" in result and "作用域: global" not in result

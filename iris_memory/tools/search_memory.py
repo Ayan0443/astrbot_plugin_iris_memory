@@ -72,6 +72,7 @@ class SearchMemoryTool(FunctionTool[AstrAgentContext]):
             adapter = get_adapter(event)
             user_id = adapter.get_user_id(event)
             group_id = adapter.get_group_id(event)
+            is_private = not group_id
 
             from ..config import get_config
 
@@ -96,6 +97,10 @@ class SearchMemoryTool(FunctionTool[AstrAgentContext]):
                 persona_id=persona_id,
             )
 
+            if results and is_private:
+                # 活人感 R1：私聊里的工具检索同样只取私聊来源 / 授权群 / global（过敏感过滤）
+                results = _private_scrub(results, config)
+
             if not results:
                 return f"未找到与「{query}」相关的记忆"
 
@@ -111,7 +116,7 @@ class SearchMemoryTool(FunctionTool[AstrAgentContext]):
 
             if with_graph:
                 graph_context = await self._get_graph_context(
-                    manager, results, group_id
+                    manager, results, group_id, config if is_private else None
                 )
                 if graph_context:
                     output_lines.append(graph_context)
@@ -129,7 +134,7 @@ class SearchMemoryTool(FunctionTool[AstrAgentContext]):
             return f"检索记忆失败：{str(e)}"
 
     async def _get_graph_context(
-        self, manager, results: List[MemorySearchResult], group_id
+        self, manager, results: List[MemorySearchResult], group_id, private_config=None
     ) -> str:
         try:
             l3_adapter = manager.get_component("l3_kg", L3KGAdapter)
@@ -157,6 +162,9 @@ class SearchMemoryTool(FunctionTool[AstrAgentContext]):
                 graph_node_ids, group_id=group_id
             )
 
+            if nodes and private_config is not None:
+                nodes, edges = _private_graph(nodes, edges, private_config)
+
             if not nodes:
                 return ""
 
@@ -165,3 +173,38 @@ class SearchMemoryTool(FunctionTool[AstrAgentContext]):
         except Exception as e:
             logger.warning(f"获取图谱上下文失败：{e}")
             return ""
+
+
+def _private_scrub(results: List[MemorySearchResult], config) -> List[MemorySearchResult]:
+    """R1：私聊工具检索的 L2 结果收口；开关关闭 → 原样；异常 → 空（隐私优先）。日志只记条数。"""
+    try:
+        from ..lifelike.social import l2_filter
+
+        if not l2_filter.private_filter_enabled(config):
+            return results
+        kept, stats = l2_filter.filter_private_l2(results, l2_filter.allowed_groups_from_config(config))
+        dropped = len(results) - len(kept)
+        if dropped:
+            logger.info(
+                f"[lifelike.private_l2] tool dropped={dropped} unauthorized={stats['unauthorized']}"
+                f" sensitive={stats['sensitive']} kept={stats['kept']}"
+            )
+        return kept
+    except Exception as e:
+        logger.warning(f"[lifelike.private_l2] tool filter failed: {type(e).__name__}")
+        return []
+
+
+def _private_graph(nodes, edges, config):
+    try:
+        from ..lifelike.social import l2_filter
+
+        if not l2_filter.private_filter_enabled(config):
+            return nodes, edges
+        kept, kept_edges, _stats = l2_filter.filter_private_graph(
+            nodes, edges, l2_filter.allowed_groups_from_config(config)
+        )
+        return kept, kept_edges
+    except Exception as e:
+        logger.warning(f"[lifelike.private_l2] tool graph filter failed: {type(e).__name__}")
+        return [], []

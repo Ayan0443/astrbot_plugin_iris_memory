@@ -8,14 +8,16 @@ Iris Chat Memory - 学习采集与配对
 """
 
 import re
-from typing import Optional, TYPE_CHECKING
+import time
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 from ..core import get_logger
+from ..lifelike.style.guard import learning_gate, learning_gate_count_only
 from ..platform import get_adapter
 from ..utils.token_counter import count_tokens
 from . import expression
 from .jargon import JargonLearner
-from .reviewer import LearningReviewer
+from .reviewer import LearningReviewer, cutesy_gate_enabled
 from .storage import LearningStorage
 
 if TYPE_CHECKING:
@@ -23,6 +25,17 @@ if TYPE_CHECKING:
     from astrbot.api.provider import LLMResponse
 
 logger = get_logger("learning.collector")
+
+
+def _tail_particle_rule_enabled() -> bool:
+    """P1-3 开关 learning_expression_tail_particle_rule：true = 旧抽取规则；异常时取旧规则。"""
+    try:
+        from ..config import get_config
+
+        value = get_config().get("learning_expression_tail_particle_rule", True)
+    except Exception:
+        return True
+    return value is not False
 
 # 图片占位符：[图:...] / [IMG:...]
 _IMAGE_PLACEHOLDER = re.compile(r"\[(?:图:[^\]]*|IMG:[^\]]*)\]")
@@ -52,6 +65,41 @@ class LearningCollector:
         self._storage = storage
         self._jargon = jargon
         self._reviewer = reviewer
+        # 闸门当日拦截计数（只记规则名与次数，不记原文；进程内，重启清零）
+        self._gate_day = ""
+        self._gate_counts: Dict[str, int] = {}
+
+    def _gate_blocked(self, user_text: str, bot_text: str) -> bool:
+        """口吻附录 §5.4 (1) 零 LLM 闸门；异常时放行（回到旧行为）并记日志"""
+        if not cutesy_gate_enabled():
+            return False
+        try:
+            reasons: List[str] = learning_gate(user_text, bot_text)
+            soft: List[str] = learning_gate_count_only(user_text, bot_text)
+        except Exception as e:
+            logger.warning(f"[lifelike.style] learning gate error, pair collected as before: {type(e).__name__}")
+            return False
+        day = time.strftime("%Y-%m-%d")
+        if day != self._gate_day:
+            self._gate_day, self._gate_counts = day, {}
+        for r in soft:  # 只计数不拦截（审查 L3）
+            key = f"soft:{r}"
+            self._gate_counts[key] = self._gate_counts.get(key, 0) + 1
+        if not reasons:
+            return False
+        self._gate_counts["_total"] = self._gate_counts.get("_total", 0) + 1
+        for r in reasons:
+            self._gate_counts[r] = self._gate_counts.get(r, 0) + 1
+        logger.info(
+            f"[lifelike.style] learning gate skipped pair: rules={','.join(reasons)}"
+            f" today={self._gate_counts['_total']}"
+        )
+        return True
+
+    @property
+    def gate_counts(self) -> Dict[str, int]:
+        """当日闸门拦截计数（规则名 → 次数，``_total`` 为总数）"""
+        return dict(self._gate_counts)
 
     def on_message(
         self, event: "AstrMessageEvent", session_id: str, user_id: str, text: str
@@ -103,7 +151,8 @@ class LearningCollector:
     ) -> Optional[int]:
         """LLM 响应采集入口：对话对配对落库 + 表达模式提取
 
-        跳过：无法取到触发消息文本、回复为空、回复超 500 token。
+        跳过：无法取到触发消息文本、回复为空、回复超 500 token、
+        命中 learning_cutesy_gate 闸门（ROADMAP P0-6）。
 
         Args:
             event: 触发消息事件
@@ -118,6 +167,10 @@ class LearningCollector:
 
         bot_text = (getattr(resp, "completion_text", "") or "").strip()
         if not bot_text or count_tokens(bot_text) > _MAX_REPLY_TOKENS:
+            return None
+
+        # 做作 / 过度卖萌 / 照搬 / "跟随一轮"：对话对与表达模式都不入库
+        if self._gate_blocked(user_text, bot_text):
             return None
 
         adapter = get_adapter(event)
@@ -147,7 +200,9 @@ class LearningCollector:
 
         # 规则提取表达模式候选（零 LLM）
         scene = expression.classify_scene(user_text)
-        for expr in expression.extract_expressions(bot_text):
+        for expr in expression.extract_expressions(
+            bot_text, legacy=_tail_particle_rule_enabled()
+        ):
             pattern_id = self._storage.insert_pattern(
                 group_id=group_id,
                 scene=scene,

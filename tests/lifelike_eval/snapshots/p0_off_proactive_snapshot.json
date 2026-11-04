@@ -1,0 +1,327 @@
+{
+  "group_legacy": {
+    "calls": [
+      [
+        "llm.generate_direct",
+        {
+          "module": "proactive_decision_initiate",
+          "prompt": "你是一个友善、适度的参与者。\n对感兴趣的话题会自然地加入讨论，分享自己的观点和知识。\n你懂得社交节奏，不会在别人聊得正欢时强行插话，但也不会刻意回避有价值的发言机会。\n\n<instruction>群里已经安静了 299 分钟。判断是否适合主动开启新话题或自然地抛出一个问题。\n先判断‘为什么是现在’：只有当前时间情境、最近对话留下的未完线索，或群成员共享兴趣提供了自然契机时才发言；仅仅因为群里安静，不构成发言理由。\n若决定发言（action 为 \"speak\"），由你自己选择一个切入角度填在 topic 字段（一句话，说明你想从什么角度发起，例如\"向最近发言的人请教他们聊的事\"或\"分享一个与群氛围相符的轻松话题\"）；切入角度由你结合群聊风格自行决定，每次应有所变化，避免重复最近已经聊过的内容，也不要没话找话。\n同时填写具体的 why_now 和 topic_source；缺少可靠依据时必须选择 none。message 留空，具体发言内容将由你的主人格根据 topic 与 why_now 生成。\n若不适合发言，action 为 \"none\"，topic、why_now、topic_source 与 message 均留空。\n偶尔可以在群冷场时开启话题，选择大家可能有兴趣、能接上话的内容。</instruction>\n\n<iris:reply-context motive=\"initiate\">\n[小雨(u1)] 那个游戏好感度刷到 90 分了\n[我(30003)] 这么快\n</iris:reply-context>",
+          "provider_id": "provider",
+          "system_prompt": "你正在观察一个群聊，判断是否需要发言。\n你是一个适度参与的群成员，有自己的兴趣和观点，愿意在合适时机加入对话。\n\n首先判断对话流状态：\n- 如果群友之间正在一来一回地交流（A→B→A→B），等待对话出现间隙再发言\n- 如果对话出现了自然停顿、有人提出问题无人回应、或话题悬而未决，这是好的发言时机\n\n在以下情况应该发言（action 设为 \"speak\"）：\n- 有人提出问题或寻求建议，且没有人回应\n- 话题在你擅长或感兴趣的领域内，你能提供有价值的信息或补充观点\n- 被 @ 或直接提及名字\n- 对话出现停顿，你有自然的切入点\n- 话题有趣且你能带来新的角度或信息\n- 对话中出现误解或需要澄清的地方，你能帮助纠正\n\n在以下情况不应该发言（action 设为 \"none\"）：\n- 群友之间正在一来一回地聊天，对话节奏紧凑\n- 已经有人在充分回答问题\n- 对话已经自然结束且无新话题\n\n当不确定时，如果话题与你相关或你能提供有价值的内容，倾向于发言。\n\n\n\n关于你自己的发言：\n- 消息列表中名字为「我」的条目（形如 [我(ID)]）是你自己之前说过的话，不是其他群友，不存在任何人替你代答。\n- 判断对话流、是否被 @ 或是否已被回应时，把「我」的发言视为你本人的发言。以严格的 JSON 格式输出，不要输出其他任何内容。\n\n输出格式：\n```json\n{\n  \"action\": \"speak\",\n  \"message\": \"\",\n  \"topic\": \"\",\n  \"why_now\": \"\",\n  \"topic_source\": \"\",\n  \"obs\": \"对话内容的简要概括\",\n  \"watch\": [\"用户ID列表\"],\n  \"watch_keywords\": [\"关键词列表\"],\n  \"why\": \"关注原因\",\n  \"drifted\": false,\n  \"cooldown\": 0\n}\n```\n\n字段说明：\n- action: \"speak\" 表示需要发言，\"none\" 表示不发言\n- message: 字符串，仅当指令明确要求你直接发言时，在此给出完整的发言内容；其他情况一律为空字符串 \"\"\n- topic: 字符串，仅当指令明确要求你选择切入角度时填写：你决定的话题切入角度，一句话概括；其他情况设为 \"\"\n- why_now: 字符串，仅主动发起时填写：说明为什么此刻开口自然，必须引用当前时间、最近对话中的未完线索或群体共同兴趣，不能只写‘群里安静了’\n- topic_source: 字符串，仅主动发起时填写，取 recent_context、time_context、shared_interest 之一；没有依据时不要发言\n- obs: 字符串，简要概括当前对话在讨论什么\n- watch: 字符串数组，你对后续发言感兴趣的用户的ID（必须填括号内的ID，不要填昵称）；不需要特别关注时设为 []\n- watch_keywords: 字符串数组，你对后续对话感兴趣的关键词或话题；不需要特别关注时设为 []\n- why: 字符串，简要说明关注原因；不需要关注时设为 \"\"\n- drifted: 布尔值，当你之前关注的话题已经明显偏离或结束时设为 true\n- cooldown: 整数，你认为应该暂停主动发言的分钟数（1-120）；不需要时设为 0\n\n规则：\n- 只输出 JSON，不要输出其他内容\n- 不需要特别关注任何人时，watch 设为空数组 []\n- watch 中必须使用消息格式 [昵称(ID)] 里括号内的 ID 部分，不要使用昵称\n- watch_keywords 填写你感兴趣的具体词语或短语，当后续消息包含这些词时会再次提醒你\n- watch 和 watch_keywords 可以同时使用，也可以只用其中一个\n\n判断对话流的关键原则：\n- 如果群友之间正在一来一回地聊天（A→B→A→B），说明他们在互相交流，不要打断这种对话流\n- 只有当对话出现停顿、有人提出无人回应的问题、或话题转向你擅长的领域时，才是合适的发言时机\n- 如果最近的几条消息都是同一群人在互相回应，即使话题有趣也应设 action 为 \"none\""
+        }
+      ],
+      [
+        "profile_get",
+        {
+          "group_id": "-1009990001",
+          "umo": "umo:-1009990001"
+        }
+      ],
+      [
+        "llm.generate_direct",
+        {
+          "module": "proactive_reply_initiate",
+          "prompt": "<iris:reply-context motive=\"initiate\">\n[小雨(u1)] 那个游戏好感度刷到 90 分了\n[我(30003)] 这么快\n</iris:reply-context>\n\n[提示] 本次为主动发起话题。群里安静了一段时间，以上是群聊中最近的对话（可能有些旧），你决定主动开启话题。\n切入角度：接着问上次说的好感度 90 分那个游戏\n此刻开口的理由：空档自然\n话题依据：recent_context\n请保持你的人格，模仿群里平时的说话风格和消息长度，用一两句话自然地发起，不要解释、不要提及此提示。",
+          "provider_id": "provider",
+          "system_prompt": "<system_reminder>当前时间：2026-11-03 03:00</system_reminder>\n\n【人设占位】\n\n【你记得的关于对方的信息】\n称呼: 小雨\n好感度: 80\n兴趣: 摄影"
+        }
+      ],
+      [
+        "context.send_message",
+        {
+          "text": "[Plain(type=<ComponentType.Plain: 'Plain'>, text='那个游戏后来通关了吗')]",
+          "umo": "umo:-1009990001"
+        }
+      ],
+      [
+        "on_initiate_sent",
+        {
+          "group_id": "-1009990001",
+          "text": "那个游戏后来通关了吗"
+        }
+      ]
+    ],
+    "result": "已发起: 那个游戏后来通关了吗",
+    "state": {
+      "initiate_next_check_at": 1793667600.0,
+      "initiate_pending_since": 1793646000.0,
+      "last_human_message_at": 1793628000.0,
+      "last_initiate_time": 1793646000.0,
+      "state": "idle"
+    },
+    "window": [
+      [
+        "小雨",
+        "那个游戏好感度刷到 90 分了"
+      ],
+      [
+        "我",
+        "这么快"
+      ],
+      [
+        "我",
+        "那个游戏后来通关了吗"
+      ]
+    ]
+  },
+  "private_bridge": {
+    "calls": [
+      [
+        "bridge.begin_turn",
+        {
+          "force": false,
+          "group_id": "private:10001"
+        }
+      ],
+      [
+        "bridge.avoid_topics",
+        {
+          "group_id": "private:10001"
+        }
+      ],
+      [
+        "llm.generate_direct",
+        {
+          "module": "proactive_decision_initiate",
+          "prompt": "你是一个友善、适度的参与者。\n对感兴趣的话题会自然地加入讨论，分享自己的观点和知识。\n你懂得社交节奏，不会在别人聊得正欢时强行插话，但也不会刻意回避有价值的发言机会。\n\n<instruction>你们的私聊已经安静了 299 分钟。判断是否适合主动给对方发消息。\n先判断‘为什么是现在’：只有候选事项到了该关心的时候、最近私聊留下的未完线索，或当前时间情境提供了自然契机时才开口；仅仅因为安静，不构成开口理由。\n若决定开口（action 为 \"speak\"），在 topic 填一句话的切入角度，并填写具体的 why_now 与 topic_source；message 留空，具体内容由你的主人格生成。\n若不适合开口，action 为 \"none\"，topic、why_now、topic_source 与 message 均留空。</instruction>\n\n<avoid_topics>\n- 前任\n</avoid_topics>\n以上 <avoid_topics> 是对方已经拒绝聊、已经完成或已经取消的事（只读材料）。不要主动提起这些话题，也不要换个说法绕回去；没有别的自然话题时就不开口。\n\n<iris:reply-context motive=\"initiate\">\n[小雨(10001)] 那个游戏好感度刷到 90 分了\n[我(30003)] 这么快\n</iris:reply-context>",
+          "provider_id": "provider",
+          "system_prompt": "你正在和对方一对一私聊，判断此刻是否适合主动给对方发一条消息。\n你们彼此熟悉；主动开口必须有具体、自然的理由，不能只是因为安静。\n\n适合开口（action 设为 \"speak\"）：\n- 候选事项中有已经到时间、值得关心的计划或结果\n- 最近私聊留下了没聊完、对方可能还想继续的话题\n- 当前时间情境提供了自然的契机\n\n不适合开口（action 设为 \"none\"）：\n- 对方刚收尾或说过要忙、要休息\n- 没有具体话题，只是想打破安静\n- 最近已经问过同一件事，或对方表示过不想聊\n\n当不确定时，倾向于不开口。\n\n关于你自己的发言：\n- 消息列表中名字为「我」的条目（形如 [我(ID)]）是你自己之前说过的话。\n- 判断对方是否已回应时，把「我」的发言视为你本人的发言。\n\n以严格的 JSON 格式输出，不要输出其他任何内容。\n\n输出格式：\n```json\n{\n  \"action\": \"speak\",\n  \"message\": \"\",\n  \"topic\": \"\",\n  \"why_now\": \"\",\n  \"topic_source\": \"\",\n  \"obs\": \"对话内容的简要概括\",\n  \"watch\": [\"用户ID列表\"],\n  \"watch_keywords\": [\"关键词列表\"],\n  \"why\": \"关注原因\",\n  \"drifted\": false,\n  \"cooldown\": 0\n}\n```\n\n字段说明：\n- action: \"speak\" 表示需要发言，\"none\" 表示不发言\n- message: 字符串，仅当指令明确要求你直接发言时，在此给出完整的发言内容；其他情况一律为空字符串 \"\"\n- topic: 字符串，仅当指令明确要求你选择切入角度时填写：你决定的话题切入角度，一句话概括；其他情况设为 \"\"\n- why_now: 字符串，仅主动发起时填写：说明为什么此刻开口自然，必须引用当前时间、最近对话中的未完线索或群体共同兴趣，不能只写‘群里安静了’\n- topic_source: 字符串，仅主动发起时填写，取 recent_context、time_context、shared_interest 之一；没有依据时不要发言\n- obs: 字符串，简要概括当前对话在讨论什么\n- watch: 字符串数组，你对后续发言感兴趣的用户的ID（必须填括号内的ID，不要填昵称）；不需要特别关注时设为 []\n- watch_keywords: 字符串数组，你对后续对话感兴趣的关键词或话题；不需要特别关注时设为 []\n- why: 字符串，简要说明关注原因；不需要关注时设为 \"\"\n- drifted: 布尔值，当你之前关注的话题已经明显偏离或结束时设为 true\n- cooldown: 整数，你认为应该暂停主动发言的分钟数（1-120）；不需要时设为 0\n\n规则：\n- 只输出 JSON，不要输出其他内容\n- 不需要特别关注任何人时，watch 设为空数组 []\n- watch 中必须使用消息格式 [昵称(ID)] 里括号内的 ID 部分，不要使用昵称\n- watch_keywords 填写你感兴趣的具体词语或短语，当后续消息包含这些词时会再次提醒你\n- watch 和 watch_keywords 可以同时使用，也可以只用其中一个"
+        }
+      ],
+      [
+        "bridge.mark_turn",
+        {
+          "item_id": null,
+          "llm_calls": 1,
+          "state": "generating",
+          "turn_id": "t1"
+        }
+      ],
+      [
+        "bridge.speech_context",
+        {
+          "group_id": "private:10001",
+          "item_id": null
+        }
+      ],
+      [
+        "llm.generate_direct",
+        {
+          "module": "proactive_reply_initiate",
+          "prompt": "<iris:reply-context motive=\"initiate\">\n[小雨(10001)] 那个游戏好感度刷到 90 分了\n[我(30003)] 这么快\n</iris:reply-context>\n\n[提示] 本次是你在私聊中主动给对方发消息。以上是你们最近的私聊（可能有些旧），你决定主动开口。\n切入角度：接着问上次说的好感度 90 分那个游戏\n此刻开口的理由：空档自然\n话题依据：recent_context\n请保持你的人格，像平时私聊一样自然、简短，不要解释、不要提及此提示。\n只围绕一个话题。若想分成几条消息发出，用空行隔开，最多 3 条；通常 1 条就够。",
+          "provider_id": "provider",
+          "system_prompt": "<system_reminder>当前时间：2026-11-03 03:00</system_reminder>\n\n【人设占位】\n\n<iris:continuity>\n她记得：周五交论文\n好感 90分\n</iris:continuity>\n\n【不要主动提起】\n以下话题对方已拒绝、已完成或已取消，不要主动提起，也不要换个说法绕回去：\n- 前任"
+        }
+      ],
+      [
+        "bridge.mark_turn",
+        {
+          "llm_calls": 2,
+          "parts_total": 1,
+          "state": "sending",
+          "turn_id": "t1"
+        }
+      ],
+      [
+        "bridge.presend_check",
+        {
+          "paused": false,
+          "turn_id": "t1",
+          "umo": "umo:private:10001"
+        }
+      ],
+      [
+        "bridge.send_part",
+        {
+          "idx": 0,
+          "part": "那个游戏后来通关了吗",
+          "turn_id": "t1",
+          "umo": "umo:private:10001"
+        }
+      ],
+      [
+        "bridge.finish_turn",
+        {
+          "stop_reason": "",
+          "turn_id": "t1"
+        }
+      ],
+      [
+        "bridge.owner_replied_since",
+        {
+          "turn_id": "t1"
+        }
+      ],
+      [
+        "on_initiate_sent",
+        {
+          "group_id": "private:10001",
+          "text": "那个游戏后来通关了吗"
+        }
+      ],
+      [
+        "bridge.close_turn",
+        {
+          "reason": "send_aborted",
+          "state": "skipped",
+          "turn_id": "t1"
+        }
+      ]
+    ],
+    "result": "已发起: 那个游戏后来通关了吗",
+    "state": {
+      "initiate_next_check_at": 1793667600.0,
+      "initiate_pending_since": 1793646000.0,
+      "last_human_message_at": 1793628000.0,
+      "last_initiate_time": 1793646000.0,
+      "state": "idle"
+    },
+    "window": [
+      [
+        "小雨",
+        "那个游戏好感度刷到 90 分了"
+      ],
+      [
+        "我",
+        "这么快"
+      ],
+      [
+        "我",
+        "那个游戏后来通关了吗"
+      ]
+    ]
+  },
+  "private_legacy": {
+    "calls": [
+      [
+        "llm.generate_direct",
+        {
+          "module": "proactive_decision_initiate",
+          "prompt": "你是一个友善、适度的参与者。\n对感兴趣的话题会自然地加入讨论，分享自己的观点和知识。\n你懂得社交节奏，不会在别人聊得正欢时强行插话，但也不会刻意回避有价值的发言机会。\n\n<instruction>群里已经安静了 299 分钟。判断是否适合主动开启新话题或自然地抛出一个问题。\n先判断‘为什么是现在’：只有当前时间情境、最近对话留下的未完线索，或群成员共享兴趣提供了自然契机时才发言；仅仅因为群里安静，不构成发言理由。\n若决定发言（action 为 \"speak\"），由你自己选择一个切入角度填在 topic 字段（一句话，说明你想从什么角度发起，例如\"向最近发言的人请教他们聊的事\"或\"分享一个与群氛围相符的轻松话题\"）；切入角度由你结合群聊风格自行决定，每次应有所变化，避免重复最近已经聊过的内容，也不要没话找话。\n同时填写具体的 why_now 和 topic_source；缺少可靠依据时必须选择 none。message 留空，具体发言内容将由你的主人格根据 topic 与 why_now 生成。\n若不适合发言，action 为 \"none\"，topic、why_now、topic_source 与 message 均留空。\n偶尔可以在群冷场时开启话题，选择大家可能有兴趣、能接上话的内容。</instruction>\n\n<iris:reply-context motive=\"initiate\">\n[小雨(10001)] 那个游戏好感度刷到 90 分了\n[我(30003)] 这么快\n</iris:reply-context>",
+          "provider_id": "provider",
+          "system_prompt": "你正在观察一个群聊，判断是否需要发言。\n你是一个适度参与的群成员，有自己的兴趣和观点，愿意在合适时机加入对话。\n\n首先判断对话流状态：\n- 如果群友之间正在一来一回地交流（A→B→A→B），等待对话出现间隙再发言\n- 如果对话出现了自然停顿、有人提出问题无人回应、或话题悬而未决，这是好的发言时机\n\n在以下情况应该发言（action 设为 \"speak\"）：\n- 有人提出问题或寻求建议，且没有人回应\n- 话题在你擅长或感兴趣的领域内，你能提供有价值的信息或补充观点\n- 被 @ 或直接提及名字\n- 对话出现停顿，你有自然的切入点\n- 话题有趣且你能带来新的角度或信息\n- 对话中出现误解或需要澄清的地方，你能帮助纠正\n\n在以下情况不应该发言（action 设为 \"none\"）：\n- 群友之间正在一来一回地聊天，对话节奏紧凑\n- 已经有人在充分回答问题\n- 对话已经自然结束且无新话题\n\n当不确定时，如果话题与你相关或你能提供有价值的内容，倾向于发言。\n\n\n\n关于你自己的发言：\n- 消息列表中名字为「我」的条目（形如 [我(ID)]）是你自己之前说过的话，不是其他群友，不存在任何人替你代答。\n- 判断对话流、是否被 @ 或是否已被回应时，把「我」的发言视为你本人的发言。以严格的 JSON 格式输出，不要输出其他任何内容。\n\n输出格式：\n```json\n{\n  \"action\": \"speak\",\n  \"message\": \"\",\n  \"topic\": \"\",\n  \"why_now\": \"\",\n  \"topic_source\": \"\",\n  \"obs\": \"对话内容的简要概括\",\n  \"watch\": [\"用户ID列表\"],\n  \"watch_keywords\": [\"关键词列表\"],\n  \"why\": \"关注原因\",\n  \"drifted\": false,\n  \"cooldown\": 0\n}\n```\n\n字段说明：\n- action: \"speak\" 表示需要发言，\"none\" 表示不发言\n- message: 字符串，仅当指令明确要求你直接发言时，在此给出完整的发言内容；其他情况一律为空字符串 \"\"\n- topic: 字符串，仅当指令明确要求你选择切入角度时填写：你决定的话题切入角度，一句话概括；其他情况设为 \"\"\n- why_now: 字符串，仅主动发起时填写：说明为什么此刻开口自然，必须引用当前时间、最近对话中的未完线索或群体共同兴趣，不能只写‘群里安静了’\n- topic_source: 字符串，仅主动发起时填写，取 recent_context、time_context、shared_interest 之一；没有依据时不要发言\n- obs: 字符串，简要概括当前对话在讨论什么\n- watch: 字符串数组，你对后续发言感兴趣的用户的ID（必须填括号内的ID，不要填昵称）；不需要特别关注时设为 []\n- watch_keywords: 字符串数组，你对后续对话感兴趣的关键词或话题；不需要特别关注时设为 []\n- why: 字符串，简要说明关注原因；不需要关注时设为 \"\"\n- drifted: 布尔值，当你之前关注的话题已经明显偏离或结束时设为 true\n- cooldown: 整数，你认为应该暂停主动发言的分钟数（1-120）；不需要时设为 0\n\n规则：\n- 只输出 JSON，不要输出其他内容\n- 不需要特别关注任何人时，watch 设为空数组 []\n- watch 中必须使用消息格式 [昵称(ID)] 里括号内的 ID 部分，不要使用昵称\n- watch_keywords 填写你感兴趣的具体词语或短语，当后续消息包含这些词时会再次提醒你\n- watch 和 watch_keywords 可以同时使用，也可以只用其中一个\n\n判断对话流的关键原则：\n- 如果群友之间正在一来一回地聊天（A→B→A→B），说明他们在互相交流，不要打断这种对话流\n- 只有当对话出现停顿、有人提出无人回应的问题、或话题转向你擅长的领域时，才是合适的发言时机\n- 如果最近的几条消息都是同一群人在互相回应，即使话题有趣也应设 action 为 \"none\""
+        }
+      ],
+      [
+        "profile_get",
+        {
+          "group_id": "private:10001",
+          "umo": "umo:private:10001"
+        }
+      ],
+      [
+        "llm.generate_direct",
+        {
+          "module": "proactive_reply_initiate",
+          "prompt": "<iris:reply-context motive=\"initiate\">\n[小雨(10001)] 那个游戏好感度刷到 90 分了\n[我(30003)] 这么快\n</iris:reply-context>\n\n[提示] 本次为主动发起话题。群里安静了一段时间，以上是群聊中最近的对话（可能有些旧），你决定主动开启话题。\n切入角度：接着问上次说的好感度 90 分那个游戏\n此刻开口的理由：空档自然\n话题依据：recent_context\n请保持你的人格，模仿群里平时的说话风格和消息长度，用一两句话自然地发起，不要解释、不要提及此提示。",
+          "provider_id": "provider",
+          "system_prompt": "<system_reminder>当前时间：2026-11-03 03:00</system_reminder>\n\n【人设占位】\n\n【你记得的关于对方的信息】\n称呼: 小雨\n好感度: 80\n兴趣: 摄影"
+        }
+      ],
+      [
+        "context.send_message",
+        {
+          "text": "[Plain(type=<ComponentType.Plain: 'Plain'>, text='那个游戏后来通关了吗')]",
+          "umo": "umo:private:10001"
+        }
+      ],
+      [
+        "on_initiate_sent",
+        {
+          "group_id": "private:10001",
+          "text": "那个游戏后来通关了吗"
+        }
+      ]
+    ],
+    "result": "已发起: 那个游戏后来通关了吗",
+    "state": {
+      "initiate_next_check_at": 1793667600.0,
+      "initiate_pending_since": 1793646000.0,
+      "last_human_message_at": 1793628000.0,
+      "last_initiate_time": 1793646000.0,
+      "state": "idle"
+    },
+    "window": [
+      [
+        "小雨",
+        "那个游戏好感度刷到 90 分了"
+      ],
+      [
+        "我",
+        "这么快"
+      ],
+      [
+        "我",
+        "那个游戏后来通关了吗"
+      ]
+    ]
+  },
+  "scan": {
+    "attempt_initiate": [
+      [
+        "-1009990001"
+      ],
+      [
+        "-1009990001"
+      ],
+      [
+        "-1009990001"
+      ]
+    ],
+    "calls": [],
+    "deadline_after_first": 1793646510.0,
+    "evaluate_timer": [
+      [
+        "-1009990001",
+        1,
+        [],
+        "initiate"
+      ],
+      [
+        "-1009990001",
+        1,
+        [],
+        "initiate"
+      ],
+      [
+        "-1009990001",
+        1,
+        [],
+        "initiate"
+      ]
+    ],
+    "next_deadline": 1793648043.0,
+    "state_after_first": {
+      "-1009990001": {
+        "initiate_next_check_at": 1793646510.0,
+        "initiate_pending_since": 0.0,
+        "last_human_message_at": 1793624400.0,
+        "last_initiate_time": 0.0,
+        "state": "idle"
+      },
+      "private:10001": {
+        "initiate_next_check_at": 0.0,
+        "initiate_pending_since": 0.0,
+        "last_human_message_at": 0.0,
+        "last_initiate_time": 0.0,
+        "state": "idle"
+      }
+    },
+    "state_after_second": {
+      "-1009990001": {
+        "initiate_next_check_at": 1793648043.0,
+        "initiate_pending_since": 0.0,
+        "last_human_message_at": 1793624400.0,
+        "last_initiate_time": 0.0,
+        "state": "idle"
+      },
+      "private:10001": {
+        "initiate_next_check_at": 0.0,
+        "initiate_pending_since": 0.0,
+        "last_human_message_at": 0.0,
+        "last_initiate_time": 0.0,
+        "state": "idle"
+      }
+    }
+  }
+}

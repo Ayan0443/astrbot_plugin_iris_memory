@@ -126,14 +126,20 @@ async def update_hidden_config():
 
         # 构建字段名→类型映射，校验键名和值类型
         field_types = {}
+        literal_options: Dict[str, List[str]] = {}
         for f in fields(HiddenConfig):
             type_name = (
                 f.type
                 if isinstance(f.type, str)
                 else getattr(f.type, "__name__", str(f.type))
             )
+            options = _get_literal_options(f)
+            # Literal[...]：按字符串校验并限定在可选值内（审查 L2：否则整批保存被拒）
+            if options:
+                field_types[f.name] = (str, "字符串")
+                literal_options[f.name] = options
             # 解析 "int" / "float" / "str" / "bool" 类型注解
-            if "int" in type_name:
+            elif "int" in type_name:
                 field_types[f.name] = (int, "整数")
             elif "float" in type_name:
                 field_types[f.name] = (float, "浮点数")
@@ -170,6 +176,10 @@ async def update_hidden_config():
             elif expected_type is str and not isinstance(value, str):
                 type_errors.append(
                     f"{key} 需要{type_label}，实际 {type(value).__name__}"
+                )
+            elif key in literal_options and value not in literal_options[key]:
+                type_errors.append(
+                    f"{key} 只能取 {'/'.join(literal_options[key])}"
                 )
 
         if type_errors:
